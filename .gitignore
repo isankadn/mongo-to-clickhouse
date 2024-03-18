@@ -1,0 +1,136 @@
+# Application specific files
+.env
+config.yml
+config-dev.yml
+config-prod.yml
+
+# Compiled files
+/target/
+**/*.rs.bk
+
+# Rustdoc output
+/doc/
+
+# Cargo lock file - Consider including this in version control for binary projects
+# /Cargo.lock
+
+# Dependency directories (remove the leading '#' at the beginning of the line if you want to include this)
+# /vendor/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows specific
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# Windows Installer files
+*.exe
+*.dll
+*.sys
+*.ocx
+*.inf
+*.drv
+*.com
+*.bat
+*.cmd
+
+# Windows shortcuts
+*.lnk
+
+# IDE - JetBrains (IntelliJ, PyCharm, PhpStorm, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# IDE - Visual Studio Code
+.vscode/
+*.code-workspace
+
+# IDE - Eclipse
+*.pydevproject
+.project
+.metadata
+.bin/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~.nib
+local.properties
+.settings/
+.loadpath
+.recommenders
+
+# IDE - NetBeans
+/nbproject/private/
+/build/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# IDE - Visual Studio
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.pdb
+*.ilk
+*.aps
+*.pch
+*.vs/
+*.vscodeworkspace
+*.nupkg
+*.snk
+*.tlb
+*.vsix
+*.xap
+*.testsettings
+*.vsmdi
+*.csproj.user
+*.cache
+*.crashreport
+*.log
+Debug/
+Release/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/

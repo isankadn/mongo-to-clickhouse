@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    volumes:
+      - .:/usr/src/app
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+    environment:
+      - DATABASE_URL=${PG_DATABASE_URL}
+      - RUST_LOG=${RUST_LOG}
+    depends_on:
+      - db
+    ports:
+      - "18000:8000"
+    networks:
+      - research_data_net
+
+  db:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - research_data_net
+
+volumes:
+  cargo_registry:
+  cargo_git:
+  postgres_data:
+
+networks:
+  research_data_net:
+      driver: bridge
