@@ -95,7 +95,6 @@ async fn process_tenant_records(
     let mut options = mongodb::options::ChangeStreamOptions::default();
     if let Some(row) = row {
         let token_bytes: Vec<u8> = row.get("token");
-        println!("<<-- Resume token before: {:?}", token_bytes);
         if let Ok(resume_token) = bson::from_slice::<ResumeToken>(&token_bytes) {
             options.resume_after = Some(resume_token);
         }
@@ -135,7 +134,7 @@ async fn process_tenant_records(
                                 {
                                     if let Some(name) = account.get_mut("name") {
                                         let anonymized_name =
-                                            anonymize_data(name, &app_state.config.encryption_salt);
+                                            anonymize_data(name, &app_state.config.encryption_salt, &tenant_config.name);
                                         *name = Bson::String(anonymized_name);
                                         info!("<<-- Modified statement: {:?}", statement);
                                     } else {
@@ -227,10 +226,11 @@ async fn process_tenant_records(
     Ok(())
 }
 
-fn anonymize_data(data: &Bson, encryption_salt: &str) -> String {
+fn anonymize_data(data: &Bson, encryption_salt: &str, tenant_name: &str) -> String {
     let mut hasher = Sha256::new();
     // let salt = &settings.encryption_salt;
-    hasher.update(encryption_salt.as_bytes());
+    let salt = format!("{}{}", encryption_salt, tenant_name);
+    hasher.update(salt.as_bytes());
 
     let data_str = match data {
         Bson::String(s) => s.as_str(),
