@@ -76,9 +76,10 @@ async fn process_tenant_records(
     pool_index: usize,
 ) -> Result<()> {
     let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
-    // println!("<<-- mongo_uri {:?}", &tenant_config.mongo_uri);
+    println!("<<-- mongo_uri {:?}", &tenant_config.mongo_uri);
     // println!("<<-- mongo_client {:?}", mongo_client);
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
+    println!("<<-- mongo_db: {:?}", mongo_db);
     let mongo_collection: mongodb::Collection<Document> =
         mongo_db.collection(&tenant_config.mongo_collection);
 
@@ -104,7 +105,7 @@ async fn process_tenant_records(
     let mut change_stream = mongo_collection.watch(None, change_stream_options).await?;
 
     while let Some(result) = change_stream.next().await {
-        // println!(">>--- Change event: {:?}", result);
+        println!(">>--- Change event: {:?}", result);
         match result {
             Ok(change_event) => {
                 if let ChangeStreamEvent {

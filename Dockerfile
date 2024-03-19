@@ -17,8 +17,9 @@ FROM rust:slim
 WORKDIR /app
 
 COPY --from=builder /app/target/release/mongo-to-clickhouse .
+COPY config-prod.yml ./config-prod.yml
+COPY config-dev.yml ./config-dev.yml
 
-ENV RUST_ENV=prod
 ENV RUSTFLAGS="-C target-cpu=native"
-
+ENV RUST_ENV=prod 
 CMD ["./mongo-to-clickhouse"]
