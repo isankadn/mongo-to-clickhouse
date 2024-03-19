@@ -6,6 +6,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY config-prod.yml ./config-prod.yml
+COPY config-dev.yml ./config-dev.yml
 ENV RUSTFLAGS="-C target-cpu=native"
 
 RUN cargo build --release
