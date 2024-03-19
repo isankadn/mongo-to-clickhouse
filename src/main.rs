@@ -253,7 +253,6 @@ async fn insert_into_clickhouse(
 ) {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
 
-    // Escape single quotes in the statement string
     let escaped_statement_str = statement_str.replace("'", "\\\'");
 
     let insert_query = format!(
@@ -261,7 +260,6 @@ async fn insert_into_clickhouse(
         full_table_name, record_id_str, escaped_statement_str
     );
 
-    // Assuming `get()` or a similar async method is available to obtain a connection
     let mut client = match ch_pool.get_handle().await {
         Ok(client) => client,
         Err(e) => {
@@ -287,7 +285,7 @@ async fn insert_into_clickhouse(
                     error!("Max retries reached. Giving up.");
                     return;
                 } else {
-                    let delay_ms = 1000 * retry_count; // Increase delay with each retry
+                    let delay_ms = 1000 * retry_count; 
                     info!("Retrying in {} ms...", delay_ms);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }

@@ -2,6 +2,7 @@
 .env
 config.yml
 config-dev.yml
+config-prod.yml
 
 # Compiled files
 /target/
