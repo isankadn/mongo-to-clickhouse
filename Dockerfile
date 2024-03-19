@@ -1,19 +1,23 @@
-FROM rust:latest
-
+# Build Stage
+FROM rust:latest as builder
 
 WORKDIR /app
 
-
 COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY config-prod.yml ./config-prod.yml
+ENV RUSTFLAGS="-C target-cpu=native"
 
 RUN cargo build --release
-RUN rm src/*.rs
 
+# Production Stage
+FROM rust:slim
 
-COPY src ./src
+WORKDIR /app
 
+COPY --from=builder /app/target/release/mongo-to-clickhouse .
 
-RUN cargo install cargo-watch
+ENV RUST_ENV=production
+ENV RUSTFLAGS="-C target-cpu=native"
 
-
-CMD ["cargo", "watch", "-x", "run"]
+CMD ["./mongo-to-clickhouse"]

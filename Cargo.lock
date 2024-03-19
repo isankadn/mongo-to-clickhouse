@@ -1064,7 +1064,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mongo-to-clickhouse2"
+name = "mongo-to-clickhouse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
