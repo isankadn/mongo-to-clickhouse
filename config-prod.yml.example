@@ -1,0 +1,21 @@
+tenants:
+  # name: Once set, DO NOT change. 
+  - name: <tenant_name>
+    mongo_uri: mongodb://<host>:<port>/?replicaSet=rs0
+    mongo_db: <database_name>
+    mongo_collection: <mongo_collection>
+    clickhouse_uri: tcp://<user>:<password>@<host>:9000
+    clickhouse_table: <clickhouse_table>
+  # name: Once set, DO NOT change. 
+  - name: <tenant_name>
+    mongo_uri: mongodb://<host>:<port>/?replicaSet=rs0
+    mongo_db: <database_name>
+    mongo_collection: <mongo_collection>
+    clickhouse_uri: tcp://<user>:<password>@<host>:9000
+    clickhouse_table: <clickhouse_table>
+postgres_db: <database_name>
+pg_database_url: postgres://<user>:<password>@<host>:<port>/postgres
+rust_log: info
+rust_backtrace: 0
+# encryption_salt: Once set, DO NOT change. 
+encryption_salt: <YOUR_SALT_HERE>
