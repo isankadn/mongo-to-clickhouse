@@ -18,7 +18,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/mongo-to-clickhouse .
 
-ENV RUST_ENV=production
+ENV RUST_ENV=prod
 ENV RUSTFLAGS="-C target-cpu=native"
 
 CMD ["./mongo-to-clickhouse"]
