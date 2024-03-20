@@ -1,6 +1,5 @@
-workspace = { members = ["historical_data"] }
 [package]
-name = "mongo-to-clickhouse"
+name = "historical_data"
 version = "0.1.0"
 edition = "2021"
 
@@ -26,12 +25,3 @@ bb8-postgres = "0.8.1"
 serde_json = "1.0.114"
 serde_yaml = "0.9.33"
 rayon = "1.9.0"
-
-
-[[bin]]
-name = "mongo-to-clickhouse"
-path = "src/main.rs"
-
-[[bin]]
-name = "historical_data"
-path = "historical_data/src/main.rs"
