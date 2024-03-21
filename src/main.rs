@@ -134,8 +134,11 @@ async fn process_tenant_records(
                                     .and_then(|acc| acc.as_document_mut())
                                 {
                                     if let Some(name) = account.get_mut("name") {
-                                        let anonymized_name =
-                                            anonymize_data(name, &app_state.config.encryption_salt, &tenant_config.name);
+                                        let anonymized_name = anonymize_data(
+                                            name,
+                                            &app_state.config.encryption_salt,
+                                            &tenant_config.name,
+                                        );
                                         *name = Bson::String(anonymized_name);
                                         info!("<<-- Modified statement: {:?}", statement);
                                     } else {
@@ -286,11 +289,53 @@ async fn insert_into_clickhouse(
                     error!("Max retries reached. Giving up.");
                     return;
                 } else {
-                    let delay_ms = 1000 * retry_count; 
+                    let delay_ms = 1000 * retry_count;
                     info!("Retrying in {} ms...", delay_ms);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
             }
+        }
+    }
+}
+
+async fn deduplicate_clickhouse_data(
+    ch_pool: &ClickhousePool,
+    clickhouse_db: &str,
+    clickhouse_table: &str,
+) -> Result<()> {
+    let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
+    let mut client = match ch_pool.get_handle().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get client from ClickHouse pool: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    let deduplicate_query = format!(
+        "
+        CREATE TABLE {table}_dedup AS
+        SELECT * FROM (
+            SELECT *, row_number() OVER (PARTITION BY id ORDER BY id) AS row_num
+            FROM {table}
+        )
+        WHERE row_num = 1;
+
+        DROP TABLE {table};
+
+        RENAME TABLE {table}_dedup TO {table};
+        ",
+        table = full_table_name
+    );
+
+    match client.execute(deduplicate_query.as_str()).await {
+        Ok(_) => {
+            info!("Successfully deduplicated data in ClickHouse");
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to deduplicate data in ClickHouse: {}", e);
+            Err(e.into())
         }
     }
 }
