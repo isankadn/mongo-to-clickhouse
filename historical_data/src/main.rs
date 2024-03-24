@@ -127,13 +127,16 @@ async fn process_tenant_historical_data(
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         receivers.push(rx);
     }
+    info!("before receivers!");
     for mut rx in receivers {
         let tenant_config = Arc::clone(&tenant_config);
         let ch_pool = Arc::clone(&ch_pool);
         let pg_pool = Arc::new(app_state.pg_pool.clone());
         tokio::spawn(async move {
             while let Some(batch) = rx.recv().await {
+                info!("inside batch start.");
                 for (record_id_str, statement_str) in batch {
+                    info!("just before insert_into_clickhouse call.");
                     if let Err(e) = insert_into_clickhouse(
                         &ch_pool,
                         &[(record_id_str, statement_str)],
