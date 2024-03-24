@@ -529,7 +529,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .unwrap();
     });
 
-    tokio::spawn(retry_failed_batches(app_state));
+    let handle = tokio::spawn(retry_failed_batches(app_state));
+
+    if let Err(e) = handle.await {
+        error!("retry_failed_batches task failed: {}", e);
+    } else {
+        info!("Processing finished, exiting...");
+    }
 
     signal::ctrl_c().await?;
     info!("Received shutdown signal, shutting down gracefully...");
