@@ -37,7 +37,7 @@ struct AppConfig {
     tenants: Vec<TenantConfig>,
     encryption_salt: String,
     batch_size: u64,
-    max_concurrency: usize,
+    number_of_workers: usize,
     pg_database_url: String,
 }
 
@@ -117,7 +117,7 @@ async fn process_tenant_historical_data(
 
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
-    let num_workers = 4;
+    let num_workers = app_state.config.number_of_workers;
     let (sender, _) = tokio::sync::broadcast::channel(num_workers);
 
     for _ in 0..num_workers {
