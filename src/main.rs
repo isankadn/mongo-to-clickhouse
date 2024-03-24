@@ -109,7 +109,7 @@ async fn process_tenant_records(
     let mut change_stream = mongo_collection.watch(None, change_stream_options).await?;
 
     while let Some(result) = change_stream.next().await {
-        println!(">>--- Change event: {:?}", result);
+        // println!(">>--- Change event: {:?}", result);
         match result {
             Ok(change_event) => {
                 if let ChangeStreamEvent {
@@ -347,7 +347,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         postgres_pool,
         clickhouse_pools,
     });
-    println!("app_state_main {:?}", app_state);
+    // println!("app_state_main {:?}", app_state);
     let _ = run(app_state).await;
     tokio::signal::ctrl_c()
         .await

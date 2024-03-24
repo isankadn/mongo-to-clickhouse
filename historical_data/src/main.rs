@@ -114,10 +114,8 @@ async fn process_tenant_historical_data(
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
 
-    // Create a channel to send batches of documents
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    // Spawn a fixed number of worker tasks
     let num_workers = 4;
     let mut receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<Vec<(String, String)>>> =
         Vec::new();
@@ -158,7 +156,6 @@ async fn process_tenant_historical_data(
 
         match mongo_collection.find(None, options).await {
             Ok(mut cursor) => {
-                // Process documents and send batches to the channel
                 let mut batch = Vec::with_capacity(batch_size as usize);
                 while let Some(result) = cursor.next().await {
                     if let Ok(doc) = result {
