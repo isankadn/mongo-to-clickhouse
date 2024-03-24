@@ -17,7 +17,8 @@ use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use std::{env, error::Error, sync::Arc};
-use tokio::sync::Semaphore;
+use tokio::signal;
+use tokio::sync::oneshot;
 
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
@@ -91,7 +92,9 @@ async fn process_tenant_historical_data(
     start_date: chrono::NaiveDate,
     end_date: chrono::NaiveDate,
 ) -> Result<()> {
-    let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
+    let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri)
+        .await
+        .map_err(|e| anyhow!("Failed to connect to MongoDB: {}", e))?;
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
     let mongo_collection = mongo_db.collection::<Document>(&tenant_config.mongo_collection);
 
@@ -235,8 +238,9 @@ async fn insert_into_clickhouse(
     let mut client = match ch_pool.get_handle().await {
         Ok(client) => client,
         Err(e) => {
-            error!("Failed to get client from ClickHouse pool: {}", e);
-            return Err(e.into());
+            let err_msg = format!("Failed to get client from ClickHouse pool: {}", e);
+            error!("{}", err_msg);
+            return Err(anyhow!(err_msg));
         }
     };
 
@@ -264,10 +268,12 @@ async fn insert_into_clickhouse(
                 return Ok(());
             }
             Err(e) => {
-                error!("Failed to insert statements into ClickHouse: {}", e);
+                let err_msg = format!("Failed to insert statements into ClickHouse: {}", e);
+                error!("{}", err_msg);
                 retry_count += 1;
                 if retry_count == max_retries {
-                    error!("Max retries reached for insertion. Logging failed batch.");
+                    let err_msg = "Max retries reached for insertion. Logging failed batch.";
+                    error!("{}", err_msg);
                     log_failed_batch(
                         pg_pool,
                         tenant_name,
@@ -302,7 +308,7 @@ async fn deduplicate_clickhouse_data(
             return Err(e.into());
         }
     };
-
+    info!("processing duplicate data...");
     let create_dedup_table_query = format!(
         "CREATE TABLE {table}_dedup
         ENGINE = MergeTree()
@@ -511,10 +517,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         clickhouse_pools: vec![clickhouse_pool],
         pg_pool,
     });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    run(app_state.clone(), tenant_name, start_date, end_date).await?;
+    let app_state_clone = app_state.clone();
+    tokio::spawn(async move {
+        run(app_state_clone, tenant_name, start_date, end_date)
+            .await
+            .unwrap();
+    });
 
     tokio::spawn(retry_failed_batches(app_state));
+
+    signal::ctrl_c().await?;
+    info!("Received shutdown signal, shutting down gracefully...");
+
+    shutdown_tx.send(()).unwrap();
 
     Ok(())
 }
