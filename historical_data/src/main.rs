@@ -48,7 +48,7 @@ async fn run(app_state: Arc<AppState>, tenant_name: String) -> Result<(), Box<dy
         .iter()
         .find(|t| t.name == tenant_name)
         .ok_or_else(|| anyhow!("Tenant not found in the configuration"))?;
-    println!("tenant name {:?}", tenant.name);
+    // println!("tenant name {:?}", tenant.name);
     if let Err(e) = process_tenant_historical_data(tenant.clone(), Arc::clone(&app_state), 0).await
     {
         error!("Error processing tenant {}: {}", tenant.name, e);
@@ -94,7 +94,7 @@ async fn process_tenant_historical_data(
         match mongo_collection.find(None, options).await {
             Ok(mut cursor) => {
                 while let Some(result) = cursor.next().await {
-                    print!("tent info {:?}", &tenant_config.name);
+                    // print!("tent info {:?}", &tenant_config.name);
                     if let Ok(doc) = result {
                         let record_id = doc.get("_id").and_then(|id| id.as_object_id());
                         let statement = doc.get("statement").and_then(|s| s.as_document());
