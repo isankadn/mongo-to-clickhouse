@@ -8,7 +8,6 @@ use mongodb::{
     Client as MongoClient,
 };
 use rayon::prelude::*;
-use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
@@ -249,7 +248,7 @@ async fn insert_into_clickhouse(
 
     let max_retries = 5;
     let mut retry_count = 0;
-
+    info!("bulk_insert_values: {:?}", bulk_insert_values);
     while retry_count < max_retries {
         let insert_data: Vec<String> = bulk_insert_values
             .iter()
@@ -264,7 +263,7 @@ async fn insert_into_clickhouse(
             full_table_name,
             insert_data.join(",")
         );
-
+        info!("insert_query: {:?}", insert_query);
         match client.execute(insert_query.as_str()).await {
             Ok(_) => {
                 info!("Successfully inserted statements into ClickHouse");
@@ -534,7 +533,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = handle.await {
         error!("retry_failed_batches task failed: {}", e);
     } else {
-        info!("Processing finished, exiting...");
+        info!("Retry finished!");
     }
 
     signal::ctrl_c().await?;
