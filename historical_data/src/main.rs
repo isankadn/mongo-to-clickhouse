@@ -3,7 +3,7 @@ use clickhouse_rs::{Client as ClickhouseClient, Pool as ClickhousePool};
 use futures::stream::{self, StreamExt};
 use log::{error, info};
 use mongodb::{
-    bson::{self, Bson, Document},
+    bson::{self, doc, Bson, Document},
     options::FindOptions,
     Client as MongoClient,
 };
@@ -13,11 +13,11 @@ use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
 
-use std::{env, error::Error, sync::Arc};
-use tokio::sync::Semaphore;
-
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use std::{env, error::Error, sync::Arc};
+use tokio::sync::Semaphore;
 
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
@@ -49,7 +49,12 @@ struct AppState {
     pg_pool: PgPool,
 }
 
-async fn run(app_state: Arc<AppState>, tenant_name: String) -> Result<(), Box<dyn Error>> {
+async fn run(
+    app_state: Arc<AppState>,
+    tenant_name: String,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<(), Box<dyn Error>> {
     let tenant = app_state
         .config
         .tenants
@@ -57,7 +62,14 @@ async fn run(app_state: Arc<AppState>, tenant_name: String) -> Result<(), Box<dy
         .find(|t| t.name == tenant_name)
         .ok_or_else(|| anyhow!("Tenant not found in the configuration"))?;
     // println!("tenant name {:?}", tenant.name);
-    if let Err(e) = process_tenant_historical_data(tenant.clone(), Arc::clone(&app_state), 0).await
+    if let Err(e) = process_tenant_historical_data(
+        tenant.clone(),
+        Arc::clone(&app_state),
+        0,
+        start_date,
+        end_date,
+    )
+    .await
     {
         error!("Error processing tenant {}: {}", tenant.name, e);
     }
@@ -76,13 +88,23 @@ async fn process_tenant_historical_data(
     tenant_config: TenantConfig,
     app_state: Arc<AppState>,
     pool_index: usize,
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
 ) -> Result<()> {
     let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
     let mongo_collection = mongo_db.collection::<Document>(&tenant_config.mongo_collection);
 
     let ch_pool = &app_state.clickhouse_pools[pool_index];
+    let start_datetime = DateTime::<Utc>::from_utc(start_date.and_hms(0, 0, 0), Utc);
+    let end_datetime = DateTime::<Utc>::from_utc(end_date.and_hms(23, 59, 59), Utc);
 
+    let filter = doc! {
+        "timestamp": {
+            "$gte": bson::DateTime::from_millis(start_datetime.timestamp_millis()),
+            "$lte": bson::DateTime::from_millis(end_datetime.timestamp_millis()),
+        }
+    };
     let total_docs = mongo_collection.estimated_document_count(None).await?;
     info!(
         "Total documents in {}: {}",
@@ -406,6 +428,11 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
     }
 }
 
+fn validate_date(date_str: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .map_err(|e| anyhow!("Invalid date format: {}", e))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -425,6 +452,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tenant_name = env::args()
         .nth(1)
         .ok_or_else(|| anyhow!("Missing tenant name argument"))?;
+
+    let start_date = env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow!("Missing start date argument"))?;
+
+    let end_date = env::args()
+        .nth(3)
+        .ok_or_else(|| anyhow!("Missing end date argument"))?;
+
+    let start_date = validate_date(&start_date)?;
+    let end_date = validate_date(&end_date)?;
+
+    if end_date < start_date {
+        return Err(anyhow!("End date must be greater than or equal to start date").into());
+    }
 
     let tenant = config
         .tenants
@@ -447,7 +489,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pg_pool,
     });
 
-    run(app_state.clone(), tenant_name).await?;
+    run(app_state.clone(), tenant_name, start_date, end_date).await?;
 
     tokio::spawn(retry_failed_batches(app_state));
 
