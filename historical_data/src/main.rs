@@ -237,32 +237,53 @@ async fn deduplicate_clickhouse_data(
         }
     };
 
-    let deduplicate_query = format!(
-        "
-        CREATE TABLE {table}_dedup AS
+    let create_dedup_table_query = format!(
+        "CREATE TABLE {table}_dedup AS
         SELECT * FROM (
             SELECT *, row_number() OVER (PARTITION BY id ORDER BY id) AS row_num
             FROM {table}
         )
-        WHERE row_num = 1;
-
-        DROP TABLE {table};
-
-        RENAME TABLE {table}_dedup TO {table};
-        ",
+        WHERE row_num = 1;",
         table = full_table_name
     );
 
-    match client.execute(deduplicate_query.as_str()).await {
+    let drop_table_query = format!("DROP TABLE {}", full_table_name);
+    let rename_table_query = format!(
+        "RENAME TABLE {}_dedup TO {}",
+        full_table_name, full_table_name
+    );
+
+    match client.execute(create_dedup_table_query.as_str()).await {
         Ok(_) => {
-            info!("Successfully deduplicated data in ClickHouse");
-            Ok(())
+            info!("Successfully created dedup table in ClickHouse");
         }
         Err(e) => {
-            error!("Failed to deduplicate data in ClickHouse: {}", e);
-            Err(e.into())
+            error!("Failed to create dedup table in ClickHouse: {}", e);
+            return Err(e.into());
         }
     }
+
+    match client.execute(drop_table_query.as_str()).await {
+        Ok(_) => {
+            info!("Successfully dropped original table in ClickHouse");
+        }
+        Err(e) => {
+            error!("Failed to drop original table in ClickHouse: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    match client.execute(rename_table_query.as_str()).await {
+        Ok(_) => {
+            info!("Successfully renamed dedup table in ClickHouse");
+        }
+        Err(e) => {
+            error!("Failed to rename dedup table in ClickHouse: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
