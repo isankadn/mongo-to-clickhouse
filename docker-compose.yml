@@ -7,6 +7,8 @@ services:
       - .:/usr/src/app
       - cargo_registry:/usr/local/cargo/registry
       - cargo_git:/usr/local/cargo/git
+      - ./config-dev.yml:/app/config-dev.yml
+      - ./config-prod.yml:/app/config-prod.yml
     environment:
       - DATABASE_URL=${PG_DATABASE_URL}
       - RUST_LOG=${RUST_LOG}
