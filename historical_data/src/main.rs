@@ -117,23 +117,16 @@ async fn process_tenant_historical_data(
 
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
-
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-
     let num_workers = 4;
-    let mut receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<Vec<(String, String)>>> =
-        Vec::new();
+    let (sender, _) = tokio::sync::broadcast::channel(num_workers);
+
     for _ in 0..num_workers {
-        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
-        receivers.push(rx);
-    }
-    info!("before receivers!");
-    for mut rx in receivers {
         let tenant_config = Arc::clone(&tenant_config);
         let ch_pool = Arc::clone(&ch_pool);
         let pg_pool = Arc::new(app_state.pg_pool.clone());
+        let mut rx = sender.subscribe();
         tokio::spawn(async move {
-            while let Some(batch) = rx.recv().await {
+            while let Ok(batch) = rx.recv().await {
                 info!("inside batch start.");
                 for (record_id_str, statement_str) in batch {
                     info!("just before insert_into_clickhouse call.");
@@ -153,7 +146,7 @@ async fn process_tenant_historical_data(
             }
         });
     }
-
+    info!("before processing batches!");
     for batch_index in 0..num_batches {
         let skip = batch_index * batch_size;
         let options = FindOptions::builder()
@@ -202,7 +195,9 @@ async fn process_tenant_historical_data(
                     }
                 }
                 if !batch.is_empty() {
-                    sender.send(batch).unwrap();
+                    if let Err(e) = sender.send(batch) {
+                        error!("Error sending batch to channel: {}", e);
+                    }
                 }
             }
             Err(e) => {
