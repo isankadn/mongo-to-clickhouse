@@ -15,10 +15,13 @@ use sha2::{Digest, Sha256};
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use rayon::prelude::*;
 use std::{env, error::Error, sync::Arc};
-use tokio::sync::{broadcast, oneshot};
 use tokio::{signal, sync::mpsc};
-
+use tokio::{
+    sync::{broadcast, oneshot},
+    task::JoinHandle,
+};
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
 #[derive(Deserialize, Clone)]
@@ -88,8 +91,8 @@ async fn process_tenant_historical_data(
     tenant_config: Arc<TenantConfig>,
     app_state: Arc<AppState>,
     pool_index: usize,
-    start_date: chrono::NaiveDate,
-    end_date: chrono::NaiveDate,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
 ) -> Result<()> {
     let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri)
         .await
@@ -117,47 +120,33 @@ async fn process_tenant_historical_data(
 
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
-    let num_workers = app_state.config.number_of_workers;
-    let (sender, _) = broadcast::channel(num_workers);
 
-    let worker_handles = (0..num_workers)
-        .map(|_| {
+    let batches: Vec<_> = (0..num_batches)
+        .into_par_iter()
+        .map(|batch_index| {
             let tenant_config = Arc::clone(&tenant_config);
             let ch_pool = Arc::clone(&ch_pool);
             let pg_pool = app_state.pg_pool.clone();
-            let mut receiver = sender.subscribe();
-            tokio::spawn(async move {
-                while let Ok(batch) = receiver.recv().await {
-                    for (record_id_str, statement_str) in batch {
-                        if let Err(e) = insert_into_clickhouse(
-                            &ch_pool,
-                            &[(record_id_str, statement_str)],
-                            &tenant_config.clickhouse_db,
-                            &tenant_config.clickhouse_table,
-                            &pg_pool,
-                            &tenant_config.name,
-                        )
-                        .await
-                        {
-                            error!("Error inserting into ClickHouse: {}", e);
-                        }
+            let mongo_collection = mongo_collection.clone();
+            let filter = filter.clone();
+            let app_state = Arc::clone(&app_state);
+
+            async move {
+                let skip = batch_index * batch_size;
+                let options = FindOptions::builder()
+                    .skip(skip)
+                    .limit(batch_size as i64)
+                    .projection(doc! { "_id": 1, "statement": 1 })
+                    .build();
+
+                let mut cursor = match mongo_collection.find(filter, options).await {
+                    Ok(cursor) => cursor,
+                    Err(e) => {
+                        error!("Error retrieving documents from MongoDB: {}", e);
+                        return Vec::new();
                     }
-                }
-            })
-        })
-        .collect::<Vec<_>>();
+                };
 
-    info!("before processing batches!");
-    for batch_index in 0..num_batches {
-        let skip = batch_index * batch_size;
-        let options = FindOptions::builder()
-            .skip(skip)
-            .limit(batch_size as i64)
-            .projection(doc! { "_id": 1, "statement": 1 })
-            .build();
-
-        match mongo_collection.find(filter.clone(), options).await {
-            Ok(mut cursor) => {
                 let mut batch = Vec::with_capacity(batch_size as usize);
                 while let Some(result) = cursor.next().await {
                     if let Ok(doc) = result {
@@ -188,27 +177,31 @@ async fn process_tenant_historical_data(
 
                             let statement_str = to_string(&statement).unwrap_or_default();
                             batch.push((record_id_str, statement_str));
-                            if batch.len() == batch_size as usize {
-                                if let Err(e) = sender.send(batch) {
-                                    error!("Error sending batch to workers: {}", e);
-                                }
-                                batch = Vec::with_capacity(batch_size as usize);
-                            }
                         }
                     }
                 }
-                if !batch.is_empty() {
-                    if let Err(e) = sender.send(batch) {
-                        error!("Error sending batch to workers: {}", e);
-                    }
+
+                if let Err(e) = insert_into_clickhouse(
+                    &ch_pool,
+                    &batch,
+                    &tenant_config.clickhouse_db,
+                    &tenant_config.clickhouse_table,
+                    &pg_pool,
+                    &tenant_config.name,
+                )
+                .await
+                {
+                    error!("Error inserting into ClickHouse: {}", e);
                 }
+
+                batch
             }
-            Err(e) => {
-                error!("Error retrieving documents from MongoDB: {}", e);
-            }
-        }
-    }
-    for handle in worker_handles {
+        })
+        .collect();
+
+    let handles: Vec<JoinHandle<Vec<_>>> = batches.into_iter().map(tokio::spawn).collect();
+
+    for handle in handles {
         handle.await.unwrap();
     }
 
