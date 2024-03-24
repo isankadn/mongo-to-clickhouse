@@ -16,8 +16,8 @@ use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use std::{env, error::Error, sync::Arc};
-use tokio::signal;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+use tokio::{signal, sync::mpsc};
 
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
@@ -118,34 +118,35 @@ async fn process_tenant_historical_data(
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
     let num_workers = app_state.config.number_of_workers;
-    let (sender, _) = tokio::sync::broadcast::channel(num_workers);
+    let (sender, _) = broadcast::channel(num_workers);
 
-    for _ in 0..num_workers {
-        let tenant_config = Arc::clone(&tenant_config);
-        let ch_pool = Arc::clone(&ch_pool);
-        let pg_pool = Arc::new(app_state.pg_pool.clone());
-        let mut rx = sender.subscribe();
-        tokio::spawn(async move {
-            while let Ok(batch) = rx.recv().await {
-                info!("inside batch start.");
-                for (record_id_str, statement_str) in batch {
-                    info!("just before insert_into_clickhouse call.");
-                    if let Err(e) = insert_into_clickhouse(
-                        &ch_pool,
-                        &[(record_id_str, statement_str)],
-                        &tenant_config.clickhouse_db,
-                        &tenant_config.clickhouse_table,
-                        &pg_pool,
-                        &tenant_config.name,
-                    )
-                    .await
-                    {
-                        error!("Error inserting into ClickHouse: {}", e);
+    let worker_handles = (0..num_workers)
+        .map(|_| {
+            let tenant_config = Arc::clone(&tenant_config);
+            let ch_pool = Arc::clone(&ch_pool);
+            let pg_pool = app_state.pg_pool.clone();
+            let mut receiver = sender.subscribe();
+            tokio::spawn(async move {
+                while let Ok(batch) = receiver.recv().await {
+                    for (record_id_str, statement_str) in batch {
+                        if let Err(e) = insert_into_clickhouse(
+                            &ch_pool,
+                            &[(record_id_str, statement_str)],
+                            &tenant_config.clickhouse_db,
+                            &tenant_config.clickhouse_table,
+                            &pg_pool,
+                            &tenant_config.name,
+                        )
+                        .await
+                        {
+                            error!("Error inserting into ClickHouse: {}", e);
+                        }
                     }
                 }
-            }
-        });
-    }
+            })
+        })
+        .collect::<Vec<_>>();
+
     info!("before processing batches!");
     for batch_index in 0..num_batches {
         let skip = batch_index * batch_size;
@@ -188,7 +189,9 @@ async fn process_tenant_historical_data(
                             let statement_str = to_string(&statement).unwrap_or_default();
                             batch.push((record_id_str, statement_str));
                             if batch.len() == batch_size as usize {
-                                sender.send(batch).unwrap();
+                                if let Err(e) = sender.send(batch) {
+                                    error!("Error sending batch to workers: {}", e);
+                                }
                                 batch = Vec::with_capacity(batch_size as usize);
                             }
                         }
@@ -196,7 +199,7 @@ async fn process_tenant_historical_data(
                 }
                 if !batch.is_empty() {
                     if let Err(e) = sender.send(batch) {
-                        error!("Error sending batch to channel: {}", e);
+                        error!("Error sending batch to workers: {}", e);
                     }
                 }
             }
@@ -204,6 +207,9 @@ async fn process_tenant_historical_data(
                 error!("Error retrieving documents from MongoDB: {}", e);
             }
         }
+    }
+    for handle in worker_handles {
+        handle.await.unwrap();
     }
 
     Ok(())
