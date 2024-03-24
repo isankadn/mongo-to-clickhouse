@@ -108,7 +108,9 @@ async fn process_tenant_historical_data(
             "$lte": bson::DateTime::from_millis(end_datetime.timestamp_millis()),
         }
     };
-    let total_docs = mongo_collection.estimated_document_count(None).await?;
+    let filter_clone = filter.clone();
+    let total_docs = mongo_collection.count_documents(filter_clone, None).await?;
+
     info!(
         "Total documents in {}: {}",
         tenant_config.mongo_collection, total_docs
@@ -155,9 +157,10 @@ async fn process_tenant_historical_data(
         let options = FindOptions::builder()
             .skip(skip)
             .limit(batch_size as i64)
+            .projection(doc! { "_id": 1, "statement": 1 })
             .build();
 
-        match mongo_collection.find(None, options).await {
+        match mongo_collection.find(filter.clone(), options).await {
             Ok(mut cursor) => {
                 let mut batch = Vec::with_capacity(batch_size as usize);
                 while let Some(result) = cursor.next().await {
