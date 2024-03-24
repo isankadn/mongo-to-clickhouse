@@ -12,8 +12,14 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
+
 use std::{env, error::Error, sync::Arc};
 use tokio::sync::Semaphore;
+
+use bb8::Pool;
+use bb8_postgres::PostgresConnectionManager;
+
+type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
 #[derive(Deserialize, Clone)]
 struct TenantConfig {
@@ -32,6 +38,7 @@ struct AppConfig {
     encryption_salt: String,
     batch_size: u64,
     max_concurrency: usize,
+    pg_database_url: String,
 }
 
 type ClickhousePoolType = ClickhousePool;
@@ -39,6 +46,7 @@ type ClickhousePoolType = ClickhousePool;
 struct AppState {
     config: AppConfig,
     clickhouse_pools: Vec<ClickhousePoolType>,
+    pg_pool: PgPool,
 }
 
 async fn run(app_state: Arc<AppState>, tenant_name: String) -> Result<(), Box<dyn Error>> {
@@ -125,12 +133,15 @@ async fn process_tenant_historical_data(
 
                             let ch_pool = ch_pool.clone();
                             let tenant_config = tenant_config.clone();
+                            let pg_pool = app_state.pg_pool.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = insert_into_clickhouse(
                                     &ch_pool,
                                     &[(record_id_str, statement_str)],
                                     &tenant_config.clickhouse_db,
                                     &tenant_config.clickhouse_table,
+                                    &pg_pool,
+                                    &tenant_config.name,
                                 )
                                 .await
                                 {
@@ -172,6 +183,8 @@ async fn insert_into_clickhouse(
     bulk_insert_values: &[(String, String)],
     clickhouse_db: &str,
     clickhouse_table: &str,
+    pg_pool: &PgPool,
+    tenant_name: &str,
 ) -> Result<()> {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
     let mut client = match ch_pool.get_handle().await {
@@ -182,7 +195,7 @@ async fn insert_into_clickhouse(
         }
     };
 
-    let max_retries = 3;
+    let max_retries = 5;
     let mut retry_count = 0;
 
     while retry_count < max_retries {
@@ -209,7 +222,15 @@ async fn insert_into_clickhouse(
                 error!("Failed to insert statements into ClickHouse: {}", e);
                 retry_count += 1;
                 if retry_count == max_retries {
-                    error!("Max retries reached. Giving up.");
+                    error!("Max retries reached for insertion. Logging failed batch.");
+                    log_failed_batch(
+                        pg_pool,
+                        tenant_name,
+                        clickhouse_db,
+                        clickhouse_table,
+                        &bulk_insert_values,
+                    )
+                    .await?;
                     return Err(e.into());
                 } else {
                     let delay_ms = 1000 * retry_count;
@@ -292,6 +313,99 @@ async fn deduplicate_clickhouse_data(
     Ok(())
 }
 
+async fn log_failed_batch(
+    pg_pool: &PgPool,
+    tenant_name: &str,
+    clickhouse_db: &str,
+    clickhouse_table: &str,
+    failed_batch: &[(String, String)],
+) -> Result<()> {
+    let failed_batch_json = serde_json::to_string(failed_batch)?;
+
+    let mut client = pg_pool.get().await?;
+    let statement = client
+        .prepare(
+            "INSERT INTO failed_batches (tenant_name, clickhouse_db, clickhouse_table, failed_batch)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .await?;
+
+    client
+        .execute(
+            &statement,
+            &[
+                &tenant_name,
+                &clickhouse_db,
+                &clickhouse_table,
+                &failed_batch_json,
+            ],
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
+    let pg_pool = &app_state.pg_pool;
+
+    loop {
+        let mut client = pg_pool.get().await?;
+        let statement = client
+            .prepare(
+                "SELECT id, tenant_name, clickhouse_db, clickhouse_table, failed_batch
+                 FROM failed_batches
+                 ORDER BY created_at
+                 LIMIT 100",
+            )
+            .await?;
+
+        let rows = client.query(&statement, &[]).await?;
+
+        for row in rows {
+            let failed_batch_id: i32 = row.get(0);
+            let tenant_name: String = row.get(1);
+            let clickhouse_db: String = row.get(2);
+            let clickhouse_table: String = row.get(3);
+            let failed_batch: String = row.get(4);
+
+            let tenant_config = app_state
+                .config
+                .tenants
+                .iter()
+                .find(|t| t.name == tenant_name)
+                .cloned();
+
+            if let Some(tenant_config) = tenant_config {
+                let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri);
+                let bulk_insert_values: Vec<(String, String)> =
+                    serde_json::from_str(&failed_batch)?;
+
+                if let Err(e) = insert_into_clickhouse(
+                    &ch_pool,
+                    &bulk_insert_values,
+                    &clickhouse_db,
+                    &clickhouse_table,
+                    pg_pool,
+                    &tenant_name,
+                )
+                .await
+                {
+                    error!("Error retrying failed batch: {}", e);
+                } else {
+                    let delete_statement = client
+                        .prepare("DELETE FROM failed_batches WHERE id = $1")
+                        .await?;
+                    client
+                        .execute(&delete_statement, &[&failed_batch_id])
+                        .await?;
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -321,12 +435,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let clickhouse_pool = ClickhousePool::new(tenant.clickhouse_uri);
 
+    let pg_manager = PostgresConnectionManager::new_from_stringlike(
+        &config.pg_database_url,
+        tokio_postgres::NoTls,
+    )?;
+    let pg_pool = Pool::builder().build(pg_manager).await?;
+
     let app_state = Arc::new(AppState {
         config: config.clone(),
         clickhouse_pools: vec![clickhouse_pool],
+        pg_pool,
     });
 
-    run(app_state, tenant_name).await?;
+    run(app_state.clone(), tenant_name).await?;
+
+    tokio::spawn(retry_failed_batches(app_state));
 
     Ok(())
 }
