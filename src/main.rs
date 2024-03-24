@@ -77,18 +77,18 @@ async fn process_tenant_records(
     pool_index: usize,
 ) -> Result<()> {
     let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
-    println!("<<-- mongo_uri {:?}", &tenant_config.mongo_uri);
+    // println!("<<-- mongo_uri {:?}", &tenant_config.mongo_uri);
     // println!("<<-- mongo_client {:?}", mongo_client);
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
-    println!("<<-- mongo_db: {:?}", mongo_db);
+    // println!("<<-- mongo_db: {:?}", mongo_db);
     let mongo_collection: mongodb::Collection<Document> =
         mongo_db.collection(&tenant_config.mongo_collection);
 
     let pg_pool = &app_state.postgres_pool;
     let ch_pool = &app_state.clickhouse_pools[pool_index];
-    println!("pg_pool {:?}", pg_pool);
+    // println!("pg_pool {:?}", pg_pool);
     let pg_conn = pg_pool.get().await?;
-    println!("pg_conn {:?}", pg_conn);
+    // println!("pg_conn {:?}", pg_conn);
     let row = pg_conn
         .query_one(
             "SELECT token FROM resume_token WHERE tenant_name = $1 ORDER BY id DESC LIMIT 1",
@@ -96,7 +96,7 @@ async fn process_tenant_records(
         )
         .await
         .ok();
-    println!("row {:?}", row);
+    // println!("row {:?}", row);
     let mut options = mongodb::options::ChangeStreamOptions::default();
     if let Some(row) = row {
         let token_bytes: Vec<u8> = row.get("token");
@@ -104,7 +104,7 @@ async fn process_tenant_records(
             options.resume_after = Some(resume_token);
         }
     }
-    println!("app_state {:?}", &app_state.config);
+    // println!("app_state {:?}", &app_state.config);
     let change_stream_options = ChangeStreamOptions::default();
     let mut change_stream = mongo_collection.watch(None, change_stream_options).await?;
 
