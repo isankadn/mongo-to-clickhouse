@@ -238,9 +238,15 @@ async fn deduplicate_clickhouse_data(
     };
 
     let create_dedup_table_query = format!(
-        "CREATE TABLE {table}_dedup AS
+        "CREATE TABLE {table}_dedup
+        ENGINE = MergeTree()
+        PARTITION BY toYYYYMM(created_at)
+        PRIMARY KEY id
+        ORDER BY (id, created_at)
+        SETTINGS index_granularity = 8192
+        AS
         SELECT * FROM (
-            SELECT *, row_number() OVER (PARTITION BY id ORDER BY id) AS row_num
+            SELECT *, row_number() OVER (PARTITION BY id ORDER BY created_at) AS row_num
             FROM {table}
         )
         WHERE row_num = 1;",
