@@ -246,7 +246,7 @@ async fn insert_into_clickhouse(
 
     let max_retries = 5;
     let mut retry_count = 0;
-    info!("bulk_insert_values: {:?}", bulk_insert_values);
+    // info!("bulk_insert_values: {:?}", bulk_insert_values);
     while retry_count < max_retries {
         let insert_data: Vec<String> = bulk_insert_values
             .iter()
@@ -261,7 +261,7 @@ async fn insert_into_clickhouse(
             full_table_name,
             insert_data.join(",")
         );
-        info!("insert_query: {:?}", insert_query);
+        // info!("insert_query: {:?}", insert_query);
         match client.execute(insert_query.as_str()).await {
             Ok(_) => {
                 info!("Successfully inserted statements into ClickHouse");
