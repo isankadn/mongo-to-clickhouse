@@ -4,3 +4,13 @@ CREATE TABLE resume_token (
   tenant_name VARCHAR(255),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+CREATE TABLE failed_batches (
+    ID SERIAL PRIMARY KEY,
+    tenant_name TEXT,
+    clickhouse_db TEXT,
+    clickhouse_table TEXT,
+    failed_batch TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
