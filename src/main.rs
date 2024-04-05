@@ -138,15 +138,63 @@ async fn process_tenant_records(
                                     .and_then(|acc| acc.as_document_mut())
                                 {
                                     if let Some(name) = account.get_mut("name") {
-                                        let anonymized_name = anonymize_data(
-                                            name,
-                                            &app_state.config.encryption_salt,
-                                            &tenant_config.name,
-                                        );
-                                        *name = Bson::String(anonymized_name);
-                                        info!("<<-- Modified statement: {:?}", statement);
-                                    } else {
-                                        warn!("Missing 'name' field in 'actor.account'");
+                                        if let bson::Bson::String(name_str) = name {
+                                            let anonymized_name = if name_str.contains(':') {
+                                                let parts: Vec<&str> =
+                                                    name_str.split(':').collect();
+                                                info!(
+                                                    "{}",
+                                                    &bson::Bson::String(parts[1].to_string())
+                                                );
+                                                if parts.len() == 2 {
+                                                    anonymize_data(
+                                                        &bson::Bson::String(parts[1].to_string()),
+                                                        &app_state.config.encryption_salt,
+                                                        &tenant_config.name,
+                                                    )
+                                                } else {
+                                                    anonymize_data(
+                                                        &bson::Bson::String(name_str.to_string()),
+                                                        &app_state.config.encryption_salt,
+                                                        &tenant_config.name,
+                                                    )
+                                                }
+                                            } else if name_str.contains('@') {
+                                                let parts: Vec<&str> =
+                                                    name_str.split('@').collect();
+                                                info!(
+                                                    "{}",
+                                                    &bson::Bson::String(parts[0].to_string())
+                                                );
+                                                if parts.len() == 2 {
+                                                    anonymize_data(
+                                                        &bson::Bson::String(parts[0].to_string()),
+                                                        &app_state.config.encryption_salt,
+                                                        &tenant_config.name,
+                                                    )
+                                                } else {
+                                                    anonymize_data(
+                                                        &bson::Bson::String(name_str.to_string()),
+                                                        &app_state.config.encryption_salt,
+                                                        &tenant_config.name,
+                                                    )
+                                                }
+                                            } else {
+                                                info!(
+                                                    "{}",
+                                                    &bson::Bson::String(name_str.to_string())
+                                                );
+                                                anonymize_data(
+                                                    &bson::Bson::String(name_str.to_string()),
+                                                    &app_state.config.encryption_salt,
+                                                    &tenant_config.name,
+                                                )
+                                            };
+                                            *name = bson::Bson::String(anonymized_name);
+                                            // info!("<<-- Modified statement: {:?}", statement);
+                                        } else {
+                                            warn!("Missing 'name' field in 'actor.account'");
+                                        }
                                     }
                                 } else {
                                     warn!("Missing 'account' field in 'actor'");
@@ -162,7 +210,7 @@ async fn process_tenant_records(
                                     continue;
                                 }
                             };
-                            info!("Inserting statement into ClickHouse: {}", statement_str);
+                            // info!("Inserting statement into ClickHouse: {}", statement_str);
 
                             insert_into_clickhouse(
                                 &ch_pool,
