@@ -109,7 +109,6 @@ async fn process_tenant_records(
     let mut change_stream = mongo_collection.watch(None, change_stream_options).await?;
 
     while let Some(result) = change_stream.next().await {
-        // println!(">>--- Change event: {:?}", result);
         match result {
             Ok(change_event) => {
                 if let ChangeStreamEvent {
@@ -119,16 +118,12 @@ async fn process_tenant_records(
                 {
                     let record_id = doc.get("_id").and_then(|id| id.as_object_id());
                     let statement = doc.get("statement").and_then(|s| s.as_document());
-
-                    // Extract additional fields as needed
-                    // let additional_field1 = doc.get("additional_field1").and_then(|f| f.as_str());
-                    // let additional_field2 = doc.get("additional_field2").and_then(|f| f.as_i32());
-
+    
                     match (record_id, statement) {
                         (Some(record_id), Some(statement)) => {
                             let record_id_str = record_id.to_hex();
                             info!("Record ID: {}", record_id_str);
-
+    
                             let mut statement = statement.to_owned();
                             if let Some(actor) =
                                 statement.get_mut("actor").and_then(|a| a.as_document_mut())
@@ -191,7 +186,6 @@ async fn process_tenant_records(
                                                 )
                                             };
                                             *name = bson::Bson::String(anonymized_name);
-                                            // info!("<<-- Modified statement: {:?}", statement);
                                         } else {
                                             warn!("Missing 'name' field in 'actor.account'");
                                         }
@@ -202,7 +196,7 @@ async fn process_tenant_records(
                             } else {
                                 warn!("Missing 'actor' field in 'statement'");
                             }
-
+    
                             let statement_str = match to_string(&statement) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -210,8 +204,7 @@ async fn process_tenant_records(
                                     continue;
                                 }
                             };
-                            // info!("Inserting statement into ClickHouse: {}", statement_str);
-
+    
                             insert_into_clickhouse(
                                 &ch_pool,
                                 &statement_str,
@@ -220,23 +213,18 @@ async fn process_tenant_records(
                                 &tenant_config.clickhouse_table,
                             )
                             .await;
-
-                            // println!(">>-- Statement: {}", statement_str);
                         }
                         (None, Some(_)) => {
                             warn!("Missing '_id' field in the document");
-                            // Handle the missing '_id' field, e.g., generate a unique identifier or skip the document
                         }
                         (Some(_), None) => {
                             warn!("Missing 'statement' field in the document");
-                            // Handle the missing 'statement' field, e.g., skip the document or use default values
                         }
                         (None, None) => {
                             warn!("Missing both '_id' and 'statement' fields in the document");
-                            // Handle the case when both fields are missing
                         }
                     }
-
+    
                     if let Some(resume_token) = change_stream.resume_token() {
                         let token_bytes = match bson::to_vec(&resume_token) {
                             Ok(bytes) => bytes,
@@ -246,7 +234,7 @@ async fn process_tenant_records(
                             }
                         };
                         let tenant_name = tenant_config.name.clone();
-
+    
                         let pg_pool = app_state.postgres_pool.clone();
                         match pg_pool.get().await {
                             Ok(pg_conn) => {
@@ -258,23 +246,19 @@ async fn process_tenant_records(
                                     .await
                                 {
                                     error!("Failed to update resume token in PostgreSQL: {}", e);
-                                    // Handle the error: retry or log the failure
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to get PostgreSQL connection: {}", e);
-                                // Handle the error: retry or log the failure
                             }
                         };
                     }
                 } else {
                     warn!("Missing 'full_document' field in the change stream event");
-                    // Handle the missing 'full_document' field: skip the event or use default values
                 }
             }
             Err(e) => {
                 error!("Change stream error: {}", e);
-                // Handle change stream errors: implement retry logic or log the error
             }
         }
     }
