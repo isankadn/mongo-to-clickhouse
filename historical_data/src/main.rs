@@ -8,6 +8,7 @@ use mongodb::{
     Client as MongoClient,
 };
 use rayon::prelude::*;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
@@ -109,8 +110,8 @@ async fn process_tenant_historical_data(
         .map_err(|e| anyhow!("Failed to connect to MongoDB: {}", e))?;
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
     let mongo_collection = mongo_db.collection::<Document>(&tenant_config.mongo_collection);
-    println!("start_date----------- {}", start_date);
-    println!("end_date----------- {}", end_date);
+    info!("start_date----------- {}", start_date);
+    info!("end_date----------- {}", end_date);
     let ch_pool = Arc::new(app_state.clickhouse_pools[pool_index].clone());
     let start_datetime = DateTime::<Utc>::from_utc(start_date, Utc);
     let end_datetime = DateTime::<Utc>::from_utc(end_date, Utc);
@@ -131,6 +132,34 @@ async fn process_tenant_historical_data(
 
     let batch_size = app_state.config.batch_size;
     let num_batches = (total_docs as f64 / batch_size as f64).ceil() as u64;
+    let full_table_name = format!(
+        "{}.{}",
+        tenant_config.clickhouse_db, tenant_config.clickhouse_table
+    );
+    let drop_query = format!("DROP TABLE IF EXISTS {}_dedup", full_table_name);
+
+    let client = match ch_pool.get_handle().await {
+        Ok(mut client) => {
+            match client.execute(drop_query.as_str()).await {
+                Ok(_) => println!("Table dropped successfully"),
+                Err(e) => {
+                    // Check if the error is related to the table not existing
+                    if e.to_string().contains("doesn't exist") {
+                        println!("Table does not exist, skipping DROP TABLE");
+                    } else {
+                        eprintln!("Error dropping table: {}", e);
+                        // Handle other errors appropriately
+                    }
+                }
+            }
+            client
+        }
+        Err(e) => {
+            let err_msg = format!("Failed to get client from ClickHouse pool: {}", e);
+            error!("{}", err_msg);
+            return Err(anyhow!(err_msg));
+        }
+    };
 
     let batches: Vec<_> = (0..num_batches)
         .into_par_iter()
@@ -281,6 +310,35 @@ fn anonymize_data(data: &bson::Bson, encryption_salt: &str, tenant_name: &str) -
     hex::encode(result)
 }
 
+async fn process_statement(statement: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    // Step 1: Replace all double consecutive backslashes with four backslashes
+    let re1 = Regex::new(r"\\{2}")?;
+    let output1 = re1.replace_all(statement, "\\\\\\\\").to_string();
+
+    // Step 2: Replace all single backslashes with two backslashes
+    let re2 = Regex::new(r"\\(?:\\\\)*")?;
+    let output2 = re2.replace_all(&output1, |caps: &regex::Captures| {
+        if caps[0].len() % 2 == 1 {
+            "\\\\".to_string()
+        } else {
+            caps[0].to_string()
+        }
+    });
+
+    // Step 3: Replace all more than four backslashes with four backslashes
+    let re3 = Regex::new(r"\\{4,}")?;
+    let output3 = re3.replace_all(&output2, "\\\\\\\\").to_string();
+
+    let trimmed_statement = output3
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .replace("\\'", "\\\\'")
+        .replace("'", "\\'")
+        .to_string();
+
+    Ok(trimmed_statement)
+}
+
 async fn insert_into_clickhouse(
     ch_pool: &ClickhousePool,
     bulk_insert_values: &[(String, String)],
@@ -309,11 +367,30 @@ async fn insert_into_clickhouse(
             .map(
                 |(record_id, statement)| match serde_json::to_string(statement) {
                     Ok(serialized_statement) => {
-                        let trimmed_statement = statement
+                        let re1 = Regex::new(r"\\{2}").unwrap();
+                        let output1 = re1.replace_all(statement, "\\\\\\\\").to_string();
+
+                        // Step 2: Replace all single backslashes with two backslashes
+                        let re2 = Regex::new(r"\\(?:\\\\)*").unwrap();
+                        let output2 = re2.replace_all(&output1, |caps: &regex::Captures| {
+                            if caps[0].len() % 2 == 1 {
+                                "\\\\".to_string()
+                            } else {
+                                caps[0].to_string()
+                            }
+                        });
+
+                        // Step 3: Replace all more than four backslashes with four backslashes
+                        let re3 = Regex::new(r"\\{4,}").unwrap();
+                        let output3 = re3.replace_all(&output2, "\\\\\\\\").to_string();
+
+                        let trimmed_statement = output2
                             .trim_start_matches('"')
                             .trim_end_matches('"')
+                            .replace("\\'", "\\\\'")
                             .replace("'", "\\'")
-                            .replace("\\", "\\");
+                            .to_string();
+
                         // println!("Inserting record: {}", trimmed_statement);
                         format!("('{}' , '{}')", record_id, trimmed_statement)
                     }
