@@ -362,45 +362,24 @@ async fn insert_into_clickhouse(
     // info!("bulk_insert_values: {:?}", bulk_insert_values);
     // println!("bulk_insert_values: {:?}", bulk_insert_values);
     while retry_count < max_retries {
-        let insert_data: Vec<String> = bulk_insert_values
-            .iter()
-            .map(
-                |(record_id, statement)| match serde_json::to_string(statement) {
-                    Ok(serialized_statement) => {
-                        let re1 = Regex::new(r"\\{2}").unwrap();
-                        let output1 = re1.replace_all(statement, "\\\\\\\\").to_string();
-
-                        // Step 2: Replace all single backslashes with two backslashes
-                        let re2 = Regex::new(r"\\(?:\\\\)*").unwrap();
-                        let output2 = re2.replace_all(&output1, |caps: &regex::Captures| {
-                            if caps[0].len() % 2 == 1 {
-                                "\\\\".to_string()
-                            } else {
-                                caps[0].to_string()
-                            }
-                        });
-
-                        // Step 3: Replace all more than four backslashes with four backslashes
-                        let re3 = Regex::new(r"\\{4,}").unwrap();
-                        let output3 = re3.replace_all(&output2, "\\\\\\\\").to_string();
-
-                        let trimmed_statement = output2
-                            .trim_start_matches('"')
-                            .trim_end_matches('"')
-                            .replace("\\'", "\\\\'")
-                            .replace("'", "\\'")
-                            .to_string();
-
-                        // println!("Inserting record: {}", trimmed_statement);
-                        format!("('{}' , '{}')", record_id, trimmed_statement)
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize JSON: {}", e);
-                        format!("('{}' , '')", record_id)
+        let insert_data: Vec<String> =
+            futures::future::try_join_all(bulk_insert_values.iter().map(
+                |(record_id, statement)| async move {
+                    match process_statement(statement).await {
+                        Ok(processed_statement) => {
+                            Ok(format!("('{}' , '{}')", record_id, processed_statement))
+                        }
+                        Err(e) => {
+                            error!("Failed to process statement: {}", e);
+                            Ok(format!("('{}' , '')", record_id))
+                        }
                     }
                 },
-            )
-            .collect();
+            ))
+            .await
+            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+                anyhow!("Failed to process statements: {}", e)
+            })?;
 
         let insert_query = format!(
             "INSERT INTO {} (id, statement) VALUES {}",
