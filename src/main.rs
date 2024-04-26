@@ -11,12 +11,37 @@ use mongodb::{
     options::ChangeStreamOptions,
     Client as MongoClient,
 };
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{to_string, Value};
 use sha2::{Digest, Sha256};
-use std::{env, error::Error, sync::Arc};
+use std::{env, error::Error, sync::Arc, time::Duration};
 use tokio::task;
 use tokio_postgres::{Client as PostgresClient, NoTls};
+
+lazy_static::lazy_static! {
+    static ref BACKSLASH_REGEX_1: Regex = match Regex::new(r"\\{2}") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_1: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+    static ref BACKSLASH_REGEX_2: Regex = match Regex::new(r"\\(?:\\\\)*") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_2: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+    static ref BACKSLASH_REGEX_3: Regex = match Regex::new(r"\\{4,}") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_3: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+}
 
 #[derive(Deserialize, Clone, Debug)]
 struct TenantConfig {
@@ -71,12 +96,30 @@ async fn run(app_state: Arc<AppState>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn connect_to_mongo(mongo_uri: &str) -> Result<MongoClient, mongodb::error::Error> {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match MongoClient::with_uri_str(mongo_uri).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                error!("Failed to connect to MongoDB: {}", e);
+                tokio::time::sleep(retry_delay).await;
+                retry_delay *= 2;
+                if retry_delay > Duration::from_secs(60) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 async fn process_tenant_records(
     tenant_config: TenantConfig,
     app_state: Arc<AppState>,
     pool_index: usize,
 ) -> Result<()> {
-    let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
+    let mongo_client = connect_to_mongo(&tenant_config.mongo_uri).await?;
+    //let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri).await?;
     // println!("<<-- mongo_uri {:?}", &tenant_config.mongo_uri);
     // println!("<<-- mongo_client {:?}", mongo_client);
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
@@ -118,12 +161,12 @@ async fn process_tenant_records(
                 {
                     let record_id = doc.get("_id").and_then(|id| id.as_object_id());
                     let statement = doc.get("statement").and_then(|s| s.as_document());
-    
+
                     match (record_id, statement) {
                         (Some(record_id), Some(statement)) => {
                             let record_id_str = record_id.to_hex();
                             info!("Record ID: {}", record_id_str);
-    
+
                             let mut statement = statement.to_owned();
                             if let Some(actor) =
                                 statement.get_mut("actor").and_then(|a| a.as_document_mut())
@@ -196,7 +239,7 @@ async fn process_tenant_records(
                             } else {
                                 warn!("Missing 'actor' field in 'statement'");
                             }
-    
+
                             let statement_str = match to_string(&statement) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -204,7 +247,7 @@ async fn process_tenant_records(
                                     continue;
                                 }
                             };
-    
+
                             insert_into_clickhouse(
                                 &ch_pool,
                                 &statement_str,
@@ -224,7 +267,7 @@ async fn process_tenant_records(
                             warn!("Missing both '_id' and 'statement' fields in the document");
                         }
                     }
-    
+
                     if let Some(resume_token) = change_stream.resume_token() {
                         let token_bytes = match bson::to_vec(&resume_token) {
                             Ok(bytes) => bytes,
@@ -234,7 +277,7 @@ async fn process_tenant_records(
                             }
                         };
                         let tenant_name = tenant_config.name.clone();
-    
+
                         let pg_pool = app_state.postgres_pool.clone();
                         match pg_pool.get().await {
                             Ok(pg_conn) => {
@@ -284,6 +327,36 @@ fn anonymize_data(data: &Bson, encryption_salt: &str, tenant_name: &str) -> Stri
     hex::encode(result)
 }
 
+async fn process_statement(statement: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    // Replace all double consecutive backslashes with four backslashes
+    let output1 = BACKSLASH_REGEX_1
+        .replace_all(statement, "\\\\\\\\")
+        .to_string();
+
+    // Replace all single backslashes with two backslashes
+    let output2 = BACKSLASH_REGEX_2.replace_all(&output1, |caps: &regex::Captures| {
+        if caps[0].len() % 2 == 1 {
+            "\\\\".to_string()
+        } else {
+            caps[0].to_string()
+        }
+    });
+
+    // Replace all more than four backslashes with four backslashes
+    let output3 = BACKSLASH_REGEX_3
+        .replace_all(&output2, "\\\\\\\\")
+        .to_string();
+
+    let trimmed_statement = output3
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .replace("\\'", "\\\\'")
+        .replace("'", "\\'")
+        .to_string();
+
+    Ok(trimmed_statement)
+}
+
 async fn insert_into_clickhouse(
     ch_pool: &ClickhousePool,
     statement_str: &str,
@@ -293,7 +366,14 @@ async fn insert_into_clickhouse(
 ) {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
 
-    let escaped_statement_str = statement_str.replace("'", "\\\'");
+    // let escaped_statement_str = statement_str.replace("'", "\\\'");
+    let escaped_statement_str = match process_statement(statement_str).await {
+        Ok(escaped_str) => escaped_str,
+        Err(e) => {
+            error!("Failed to process statement: {}", e);
+            return;
+        }
+    };
 
     let insert_query = format!(
         "INSERT INTO {} (id, statement) VALUES ('{}', '{}')",

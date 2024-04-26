@@ -22,6 +22,7 @@ use std::{
     error::Error,
     fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{signal, sync::mpsc};
 use tokio::{
@@ -29,6 +30,30 @@ use tokio::{
     task::JoinHandle,
 };
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
+
+lazy_static::lazy_static! {
+    static ref BACKSLASH_REGEX_1: Regex = match Regex::new(r"\\{2}") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_1: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+    static ref BACKSLASH_REGEX_2: Regex = match Regex::new(r"\\(?:\\\\)*") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_2: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+    static ref BACKSLASH_REGEX_3: Regex = match Regex::new(r"\\{4,}") {
+        Ok(regex) => regex,
+        Err(e) => {
+            error!("Failed to compile BACKSLASH_REGEX_3: {}", e);
+            panic!("Invalid regular expression pattern");
+        }
+    };
+}
 
 #[derive(Deserialize, Clone)]
 struct TenantConfig {
@@ -98,6 +123,23 @@ async fn run(
     }
 }
 
+async fn connect_to_mongo(mongo_uri: &str) -> Result<MongoClient, mongodb::error::Error> {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match MongoClient::with_uri_str(mongo_uri).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                error!("Failed to connect to MongoDB: {}", e);
+                tokio::time::sleep(retry_delay).await;
+                retry_delay *= 2;
+                if retry_delay > Duration::from_secs(60) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 async fn process_tenant_historical_data(
     tenant_config: Arc<TenantConfig>,
     app_state: Arc<AppState>,
@@ -105,7 +147,7 @@ async fn process_tenant_historical_data(
     start_date: NaiveDateTime,
     end_date: NaiveDateTime,
 ) -> Result<()> {
-    let mongo_client = MongoClient::with_uri_str(&tenant_config.mongo_uri)
+    let mongo_client = connect_to_mongo(&tenant_config.mongo_uri)
         .await
         .map_err(|e| anyhow!("Failed to connect to MongoDB: {}", e))?;
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
@@ -311,13 +353,13 @@ fn anonymize_data(data: &bson::Bson, encryption_salt: &str, tenant_name: &str) -
 }
 
 async fn process_statement(statement: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-    // Step 1: Replace all double consecutive backslashes with four backslashes
-    let re1 = Regex::new(r"\\{2}")?;
-    let output1 = re1.replace_all(statement, "\\\\\\\\").to_string();
+    // Replace all double consecutive backslashes with four backslashes
+    let output1 = BACKSLASH_REGEX_1
+        .replace_all(statement, "\\\\\\\\")
+        .to_string();
 
-    // Step 2: Replace all single backslashes with two backslashes
-    let re2 = Regex::new(r"\\(?:\\\\)*")?;
-    let output2 = re2.replace_all(&output1, |caps: &regex::Captures| {
+    // Replace all single backslashes with two backslashes
+    let output2 = BACKSLASH_REGEX_2.replace_all(&output1, |caps: &regex::Captures| {
         if caps[0].len() % 2 == 1 {
             "\\\\".to_string()
         } else {
@@ -325,9 +367,10 @@ async fn process_statement(statement: &str) -> Result<String, Box<dyn Error + Se
         }
     });
 
-    // Step 3: Replace all more than four backslashes with four backslashes
-    let re3 = Regex::new(r"\\{4,}")?;
-    let output3 = re3.replace_all(&output2, "\\\\\\\\").to_string();
+    // Replace all more than four backslashes with four backslashes
+    let output3 = BACKSLASH_REGEX_3
+        .replace_all(&output2, "\\\\\\\\")
+        .to_string();
 
     let trimmed_statement = output3
         .trim_start_matches('"')
