@@ -36,7 +36,7 @@ lazy_static::lazy_static! {
     static ref BACKSLASH_REGEX_3: Regex = Regex::new(r"\\{4,}").expect("Failed to compile BACKSLASH_REGEX_3");
 }
 
-const MAX_BATCH_SIZE: usize = 100000;
+const MAX_BATCH_SIZE: usize = 10000;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: u64 = 1000;
 
