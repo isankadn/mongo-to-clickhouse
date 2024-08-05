@@ -1,3 +1,4 @@
+// historical_data/src/main.rs
 use anyhow::{anyhow, Context, Result};
 use clickhouse_rs::Pool as ClickhousePool;
 use futures::stream::StreamExt;
@@ -376,7 +377,7 @@ fn anonymize_statement(
 
     // If we've made it this far without errors, update the original statement
     *statement = statement_copy;
-    println!("Anonymized statement: {:?}", statement);
+    // println!("Anonymized statement: {:?}", statement);
     Ok(())
 }
 
@@ -414,7 +415,7 @@ async fn insert_into_clickhouse(
     clickhouse_table: &str,
     pg_pool: &PgPool,
     tenant_name: &str,
-    batch_manager: &mut BatchSizeManager, // Added BatchSizeManager as mutable reference
+    batch_manager: &mut BatchSizeManager,
 ) -> Result<()> {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
 
