@@ -1,0 +1,37 @@
+# Development Stage
+FROM rust:latest
+
+RUN apt-get update && apt-get install -y \
+    librocksdb-dev \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-watch for auto-reloading
+RUN cargo install cargo-watch
+
+WORKDIR /app
+
+# Copy only the dependency files first to leverage Docker cache
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src directory and file to build dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies
+RUN cargo build
+
+# Remove the dummy src directory and file
+RUN rm -rf src
+
+# Copy the rest of the source code
+COPY src ./src
+COPY historical_data ./historical_data
+COPY config-prod.yml ./config-prod.yml
+COPY config-dev.yml ./config-dev.yml
+
+ENV RUSTFLAGS="-C target-cpu=native"
+ENV RUST_ENV=dev
+
+# Use cargo-watch to auto-reload on file changes
+CMD ["cargo", "watch", "-x", "run"]

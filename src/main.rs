@@ -13,12 +13,14 @@ use mongodb::{
     Client as MongoClient,
 };
 use regex::Regex;
+use rocksdb::{Options, DB};
 use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
-use std::{env, sync::Arc, time::Duration};
-use tokio::{signal, sync::oneshot, task};
+use std::path::Path;
+use std::{env, sync::Arc, time::Duration, time::Instant};
 
+use tokio::{signal, sync::oneshot, task};
 lazy_static::lazy_static! {
     static ref BACKSLASH_REGEX_1: Regex = Regex::new(r"\\{2}").expect("Failed to compile BACKSLASH_REGEX_1");
     static ref BACKSLASH_REGEX_2: Regex = Regex::new(r"\\(?:\\\\)*").expect("Failed to compile BACKSLASH_REGEX_2");
@@ -28,7 +30,29 @@ lazy_static::lazy_static! {
 const MAX_BATCH_SIZE: usize = 10000;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: u64 = 1000;
+struct RocksDBResumeTokenStore {
+    db: Arc<DB>,
+}
 
+impl RocksDBResumeTokenStore {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_max_open_files(10000);
+        opts.set_use_fsync(true);
+        let db = DB::open(&opts, path)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    pub fn update_resume_token(&self, token_bytes: &[u8], tenant_name: &str) -> Result<()> {
+        self.db.put(tenant_name.as_bytes(), token_bytes)?;
+        Ok(())
+    }
+
+    pub fn get_resume_token(&self, tenant_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get(tenant_name.as_bytes())?)
+    }
+}
 #[derive(Deserialize, Clone, Debug)]
 struct TenantConfig {
     name: String,
@@ -43,7 +67,6 @@ struct TenantConfig {
 #[derive(Deserialize, Debug)]
 struct AppConfig {
     tenants: Vec<TenantConfig>,
-    pg_database_url: String,
     encryption_salt: String,
     batch_size: usize,
     number_of_workers: usize,
@@ -54,8 +77,8 @@ type ClickhousePoolType = ClickhousePool;
 
 struct AppState {
     config: AppConfig,
-    postgres_pool: PostgresPool,
     clickhouse_pools: Vec<ClickhousePoolType>,
+    resume_token_store: Arc<RocksDBResumeTokenStore>,
 }
 
 struct BatchSizeManager {
@@ -91,11 +114,12 @@ impl BatchSizeManager {
     }
 
     fn get_current_size(&self) -> usize {
-        self.current_size
+        self.current_size // if enable this applicaitn will automatically adjust the batch size based on the system performance.
     }
 }
 
 async fn run(app_state: Arc<AppState>) -> Result<()> {
+    info!("Starting main run loop");
     let tenants = app_state.config.tenants.clone();
 
     let mut tasks = Vec::new();
@@ -103,37 +127,43 @@ async fn run(app_state: Arc<AppState>) -> Result<()> {
         let tenant_config = tenant.clone();
         let app_state = app_state.clone();
         let task = task::spawn(async move {
-            if let Err(e) = process_tenant_records(tenant_config.clone(), app_state, index).await {
-                error!("Error processing tenant {}: {}", tenant_config.name, e);
+            loop {
+                match process_tenant_records(tenant_config.clone(), app_state.clone(), index).await
+                {
+                    Ok(_) => {
+                        info!("Tenant {} processing completed", tenant_config.name);
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Error processing tenant {}: {}. Retrying in 60 seconds...",
+                            tenant_config.name, e
+                        );
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                }
             }
         });
         tasks.push(task);
     }
 
-    join_all(tasks).await;
+    // Wait for all tasks to complete, but don't stop if one fails
+    for task in tasks {
+        if let Err(e) = task.await {
+            error!("A tenant processing task panicked: {:?}", e);
+        }
+    }
+
     Ok(())
 }
 
 async fn connect_to_mongo(mongo_uri: &str) -> Result<MongoClient> {
-    let mut retry_delay = Duration::from_secs(1);
-    let mut attempts = 0;
-    loop {
-        match MongoClient::with_uri_str(mongo_uri).await {
-            Ok(client) => return Ok(client),
-            Err(e) => {
-                attempts += 1;
-                if attempts > MAX_RETRIES {
-                    return Err(e.into());
-                }
-                error!(
-                    "Failed to connect to MongoDB: {}. Retrying in {:?}",
-                    e, retry_delay
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay *= 2;
-            }
-        }
-    }
+    let client = MongoClient::with_uri_str(mongo_uri).await?;
+
+    // Perform a simple operation to check if the connection is actually working
+    client.list_database_names(None, None).await?;
+    info!("Connected to MongoDB at {}", mongo_uri);
+    Ok(client)
 }
 
 async fn process_tenant_records(
@@ -141,37 +171,57 @@ async fn process_tenant_records(
     app_state: Arc<AppState>,
     pool_index: usize,
 ) -> Result<()> {
-    let mongo_client = connect_to_mongo(&tenant_config.mongo_uri).await?;
+    let mongo_client = match connect_to_mongo(&tenant_config.mongo_uri).await {
+        Ok(client) => client,
+        Err(e) => {
+            error!(
+                "Failed to connect to MongoDB for tenant {}: {}",
+                tenant_config.name, e
+            );
+            return Err(e.into());
+        }
+    };
+
     let mongo_db = mongo_client.database(&tenant_config.mongo_db);
     let mongo_collection: mongodb::Collection<Document> =
         mongo_db.collection(&tenant_config.mongo_collection);
 
-    let pg_pool = &app_state.postgres_pool;
     let ch_pool = &app_state.clickhouse_pools[pool_index];
+    let resume_token_store = &app_state.resume_token_store;
 
-    let pg_conn = pg_pool.get().await?;
-    let row = pg_conn
-        .query_one(
-            "SELECT token FROM resume_token WHERE tenant_name = $1 ORDER BY id DESC LIMIT 1",
-            &[&tenant_config.name],
-        )
-        .await
-        .ok();
+    let resume_token = resume_token_store.get_resume_token(&tenant_config.name)?;
+    info!("Resuming change stream for tenant: {}", tenant_config.name);
+    info!("Resume token: {:?}", resume_token);
 
     let mut options = ChangeStreamOptions::default();
-    if let Some(row) = row {
-        let token_bytes: Vec<u8> = row.get("token");
+    if let Some(token_bytes) = resume_token {
         if let Ok(resume_token) = bson::from_slice::<ResumeToken>(&token_bytes) {
             options.resume_after = Some(resume_token);
         }
     }
 
-    let mut change_stream = mongo_collection.watch(None, options).await?;
+    let mut change_stream = match mongo_collection.watch(None, options).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!(
+                "Failed to create change stream for tenant {}: {}",
+                tenant_config.name, e
+            );
+            return Err(e.into());
+        }
+    };
+
     let mut batch = Vec::with_capacity(app_state.config.batch_size);
+    let mut batch_start_time = Instant::now();
+    info!(
+        "Starting change stream processing batch size: {}",
+        batch.capacity()
+    );
     let mut batch_manager =
-        BatchSizeManager::new(app_state.config.batch_size, 1000, MAX_BATCH_SIZE, 5000.0);
+        BatchSizeManager::new(app_state.config.batch_size, 1, MAX_BATCH_SIZE, 5000.0);
 
     while let Some(result) = change_stream.next().await {
+        info!("Processing change event");
         match result {
             Ok(change_event) => {
                 if let ChangeStreamEvent {
@@ -205,33 +255,40 @@ async fn process_tenant_records(
                             };
 
                             batch.push((record_id_str, statement_str));
+                            let should_process = batch.len() >= batch_manager.get_current_size()
+                                || batch_start_time.elapsed() >= Duration::from_secs(5);
 
-                            if batch.len() >= batch_manager.get_current_size() {
-                                let batch_start_time = std::time::Instant::now();
-
-                                if let Err(e) = insert_into_clickhouse(
+                            if should_process {
+                                let batch_duration = batch_start_time.elapsed();
+                                if let Err(e) = process_batch(
                                     &ch_pool,
                                     &batch,
-                                    &tenant_config.clickhouse_db,
-                                    &tenant_config.clickhouse_table,
-                                    pg_pool,
-                                    &tenant_config.name,
+                                    &tenant_config,
+                                    resume_token_store,
                                     &mut batch_manager,
+                                    batch_duration,
                                 )
                                 .await
                                 {
-                                    error!("Failed to insert batch into ClickHouse: {}", e);
-                                } else {
-                                    let batch_duration = batch_start_time.elapsed();
-                                    batch_manager.adjust_batch_size(batch.len(), batch_duration);
-
-                                    info!(
-                                        "Processed {} documents. Current batch size: {}",
-                                        batch.len(),
-                                        batch_manager.get_current_size()
-                                    );
+                                    error!("Failed to process batch: {}", e);
+                                    // Don't update resume token if batch processing failed
+                                    continue;
                                 }
+
+                                // Update resume token only after successful batch processing
+                                if let Some(resume_token) = change_stream.resume_token() {
+                                    let token_bytes = bson::to_vec(&resume_token)?;
+                                    let tenant_name = tenant_config.name.clone();
+
+                                    if let Err(e) = resume_token_store
+                                        .update_resume_token(&token_bytes, &tenant_name)
+                                    {
+                                        error!("Failed to update resume token in RocksDB: {}", e);
+                                    }
+                                }
+
                                 batch.clear();
+                                batch_start_time = Instant::now();
                             }
                         }
                         (None, Some(_)) => {
@@ -244,22 +301,14 @@ async fn process_tenant_records(
                             warn!("Missing both '_id' and 'statement' fields in the document");
                         }
                     }
-
-                    if let Some(resume_token) = change_stream.resume_token() {
-                        let token_bytes = bson::to_vec(&resume_token)?;
-                        let tenant_name = tenant_config.name.clone();
-
-                        let pg_pool = app_state.postgres_pool.clone();
-                        if let Err(e) =
-                            update_resume_token(&pg_pool, &token_bytes, &tenant_name).await
-                        {
-                            error!("Failed to update resume token in PostgreSQL: {}", e);
-                        }
-                    }
                 }
             }
             Err(e) => {
-                error!("Change stream error: {}", e);
+                error!(
+                    "Change stream error for tenant {}: {}. Restarting stream...",
+                    tenant_config.name, e
+                );
+                return Err(e.into());
             }
         }
     }
@@ -270,30 +319,57 @@ async fn process_tenant_records(
             &batch,
             &tenant_config.clickhouse_db,
             &tenant_config.clickhouse_table,
-            pg_pool,
+            resume_token_store,
             &tenant_config.name,
             &mut batch_manager,
         )
         .await
         {
             error!("Failed to insert final batch into ClickHouse: {}", e);
+        } else {
+            // Update resume token after successful processing of the final batch
+            if let Some(resume_token) = change_stream.resume_token() {
+                let token_bytes = bson::to_vec(&resume_token)?;
+                let tenant_name = tenant_config.name.clone();
+
+                if let Err(e) = resume_token_store.update_resume_token(&token_bytes, &tenant_name) {
+                    error!("Failed to update final resume token in RocksDB: {}", e);
+                }
+            }
         }
     }
     Ok(())
 }
 
-async fn update_resume_token(
-    pg_pool: &PostgresPool,
-    token_bytes: &[u8],
-    tenant_name: &str,
+async fn process_batch(
+    ch_pool: &ClickhousePoolType,
+    batch: &[(String, String)],
+    tenant_config: &TenantConfig,
+    resume_token_store: &Arc<RocksDBResumeTokenStore>,
+    batch_manager: &mut BatchSizeManager,
+    batch_duration: Duration,
 ) -> Result<()> {
-    let pg_conn = pg_pool.get().await?;
-    pg_conn
-        .execute(
-            "INSERT INTO resume_token (token, tenant_name) VALUES ($1, $2) ON CONFLICT (tenant_name) DO UPDATE SET token = EXCLUDED.token",
-            &[&token_bytes, &tenant_name],
-        )
-        .await?;
+    if let Err(e) = insert_into_clickhouse(
+        ch_pool,
+        batch,
+        &tenant_config.clickhouse_db,
+        &tenant_config.clickhouse_table,
+        resume_token_store,
+        &tenant_config.name,
+        batch_manager,
+    )
+    .await
+    {
+        error!("Failed to insert batch into ClickHouse: {}", e);
+    } else {
+        batch_manager.adjust_batch_size(batch.len(), batch_duration);
+        info!(
+            "Processed {} documents in {:?}. Current batch size: {}",
+            batch.len(),
+            batch_duration,
+            batch_manager.get_current_size()
+        );
+    }
     Ok(())
 }
 
@@ -385,7 +461,7 @@ async fn insert_into_clickhouse(
     bulk_insert_values: &[(String, String)],
     clickhouse_db: &str,
     clickhouse_table: &str,
-    pg_pool: &PostgresPool,
+    resume_token_store: &RocksDBResumeTokenStore,
     tenant_name: &str,
     batch_manager: &mut BatchSizeManager,
 ) -> Result<()> {
@@ -417,7 +493,7 @@ async fn insert_into_clickhouse(
                             chunk_index + 1
                         );
                         log_failed_batch(
-                            pg_pool,
+                            resume_token_store,
                             tenant_name,
                             clickhouse_db,
                             clickhouse_table,
@@ -486,7 +562,7 @@ async fn insert_batch(
 }
 
 async fn log_failed_batch(
-    pg_pool: &PostgresPool,
+    resume_token_store: &RocksDBResumeTokenStore,
     tenant_name: &str,
     clickhouse_db: &str,
     clickhouse_table: &str,
@@ -495,101 +571,80 @@ async fn log_failed_batch(
     let failed_batch_json =
         serde_json::to_string(failed_batch).context("Failed to serialize failed batch to JSON")?;
 
-    let mut client = pg_pool
-        .get()
-        .await
-        .context("Failed to get client from PostgreSQL pool")?;
-
-    let statement = client
-        .prepare(
-            "INSERT INTO failed_batches (tenant_name, clickhouse_db, clickhouse_table, failed_batch)
-             VALUES ($1, $2, $3, $4)",
+    resume_token_store.db.put(
+        format!(
+            "failed_batch:{}:{}:{}",
+            tenant_name, clickhouse_db, clickhouse_table
         )
-        .await
-        .context("Failed to prepare PostgreSQL statement")?;
-
-    client
-        .execute(
-            &statement,
-            &[
-                &tenant_name,
-                &clickhouse_db,
-                &clickhouse_table,
-                &failed_batch_json,
-            ],
-        )
-        .await
-        .context("Failed to execute PostgreSQL statement")?;
+        .as_bytes(),
+        failed_batch_json.as_bytes(),
+    )?;
 
     Ok(())
 }
 
 async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
-    let pg_pool = &app_state.postgres_pool;
+    let resume_token_store = &app_state.resume_token_store;
 
     loop {
-        let mut client = pg_pool
-            .get()
-            .await
-            .context("Failed to get PostgreSQL client")?;
-        let statement = client
-            .prepare(
-                "SELECT id, tenant_name, clickhouse_db, clickhouse_table, failed_batch
-                 FROM failed_batches
-                 ORDER BY created_at
-                 LIMIT 100",
-            )
-            .await
-            .context("Failed to prepare PostgreSQL statement")?;
+        let iter = resume_token_store.db.iterator(rocksdb::IteratorMode::Start);
+        let failed_batch_prefix = b"failed_batch:";
 
-        let rows = client
-            .query(&statement, &[])
-            .await
-            .context("Failed to execute PostgreSQL query")?;
-        if rows.is_empty() {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            continue;
-        }
-        for row in rows {
-            let failed_batch_id: i32 = row.get(0);
-            let tenant_name: String = row.get(1);
-            let clickhouse_db: String = row.get(2);
-            let clickhouse_table: String = row.get(3);
-            let failed_batch: String = row.get(4);
+        for item in iter {
+            let (key, value) = item?;
+            if key.starts_with(failed_batch_prefix) {
+                let key_str = String::from_utf8_lossy(&key);
+                let parts: Vec<&str> = key_str.splitn(4, ':').collect();
+                if parts.len() != 4 {
+                    error!("Invalid failed batch key format: {}", key_str);
+                    continue;
+                }
 
-            let tenant_config = app_state
-                .config
-                .tenants
-                .iter()
-                .find(|t| t.name == tenant_name)
-                .cloned();
+                let tenant_name = parts[1];
+                let clickhouse_db = parts[2];
+                let clickhouse_table = parts[3];
 
-            if let Some(tenant_config) = tenant_config {
-                let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri);
-                let bulk_insert_values: Vec<(String, String)> = serde_json::from_str(&failed_batch)
-                    .context("Failed to deserialize failed batch")?;
-                let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
-                if let Err(e) = insert_into_clickhouse(
-                    &ch_pool,
-                    &bulk_insert_values,
-                    &clickhouse_db,
-                    &clickhouse_table,
-                    pg_pool,
-                    &tenant_name,
-                    &mut batch_manager,
-                )
-                .await
-                {
-                    error!("Error retrying failed batch: {}", e);
+                let failed_batch: Vec<(String, String)> =
+                    serde_json::from_slice(&value).context("Failed to deserialize failed batch")?;
+
+                let tenant_config = app_state
+                    .config
+                    .tenants
+                    .iter()
+                    .find(|t| t.name == tenant_name)
+                    .cloned();
+
+                if let Some(tenant_config) = tenant_config {
+                    let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri.as_str());
+                    let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
+
+                    match insert_into_clickhouse(
+                        &ch_pool,
+                        &failed_batch,
+                        clickhouse_db,
+                        clickhouse_table,
+                        resume_token_store,
+                        tenant_name,
+                        &mut batch_manager,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                "Successfully retried failed batch for tenant: {}",
+                                tenant_name
+                            );
+                            resume_token_store.db.delete(key)?;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Error retrying failed batch for tenant {}: {}",
+                                tenant_name, e
+                            );
+                        }
+                    }
                 } else {
-                    let delete_statement = client
-                        .prepare("DELETE FROM failed_batches WHERE id = $1")
-                        .await
-                        .context("Failed to prepare delete statement")?;
-                    client
-                        .execute(&delete_statement, &[&failed_batch_id])
-                        .await
-                        .context("Failed to delete processed failed batch")?;
+                    error!("Tenant config not found for tenant: {}", tenant_name);
                 }
             }
         }
@@ -619,25 +674,18 @@ async fn main() -> Result<()> {
         .try_deserialize()
         .context("Failed to deserialize config")?;
 
-    let postgres_manager = PostgresConnectionManager::new(
-        config
-            .pg_database_url
-            .parse()
-            .context("Invalid PostgreSQL URL")?,
-        tokio_postgres::NoTls,
-    );
-    let postgres_pool = Pool::builder().build(postgres_manager).await?;
-
     let mut clickhouse_pools = Vec::new();
     for tenant in &config.tenants {
         let clickhouse_pool = ClickhousePool::new(tenant.clickhouse_uri.as_str());
         clickhouse_pools.push(clickhouse_pool);
     }
 
+    let resume_token_store = Arc::new(RocksDBResumeTokenStore::new("/app/data/rocksdb")?);
+
     let app_state = Arc::new(AppState {
         config,
-        postgres_pool,
         clickhouse_pools,
+        resume_token_store,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
