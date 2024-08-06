@@ -3,6 +3,7 @@
 config.yml
 config-dev.yml
 config-prod.yml
+app/
 
 # Compiled files
 /target/

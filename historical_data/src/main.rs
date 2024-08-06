@@ -1,10 +1,10 @@
+// historical_data/src/main.rs
 use anyhow::{anyhow, Context, Result};
-use clickhouse_rs::{Client as ClickhouseClient, Pool as ClickhousePool};
-use futures::stream::{self, StreamExt};
+use clickhouse_rs::Pool as ClickhousePool;
+use futures::stream::StreamExt;
 use log::{error, info, warn};
 use mongodb::{
-    bson::{self, doc, Bson, Document},
-    options::FindOptions,
+    bson::{self, doc, Document},
     Client as MongoClient,
 };
 
@@ -15,22 +15,16 @@ use sha2::{Digest, Sha256};
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
+
 use std::{
     env,
-    error::Error,
-    fmt,
     sync::{Arc, Mutex},
     time::Duration,
     time::Instant,
 };
-use tokio::{signal, sync::mpsc};
-use tokio::{
-    sync::{broadcast, oneshot},
-    task::JoinHandle,
-};
-
-
+use tokio::signal;
+use tokio::sync::oneshot;
 type PgPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 
 lazy_static::lazy_static! {
@@ -47,7 +41,12 @@ struct BatchSizeManager {
 }
 
 impl BatchSizeManager {
-    fn new(initial_size: usize, min_size: usize, max_size: usize, performance_threshold: f64) -> Self {
+    fn new(
+        initial_size: usize,
+        min_size: usize,
+        max_size: usize,
+        performance_threshold: f64,
+    ) -> Self {
         BatchSizeManager {
             current_size: initial_size,
             min_size,
@@ -70,8 +69,6 @@ impl BatchSizeManager {
         self.current_size
     }
 }
-
-
 
 const MAX_BATCH_SIZE: usize = 10000;
 const MAX_RETRIES: u32 = 5;
@@ -146,7 +143,10 @@ async fn connect_to_mongo(mongo_uri: &str) -> Result<MongoClient> {
                 if attempts > MAX_RETRIES {
                     return Err(e.into());
                 }
-                error!("Failed to connect to MongoDB: {}. Retrying in {:?}", e, retry_delay);
+                error!(
+                    "Failed to connect to MongoDB: {}. Retrying in {:?}",
+                    e, retry_delay
+                );
                 tokio::time::sleep(retry_delay).await;
                 retry_delay *= 2;
             }
@@ -181,76 +181,116 @@ async fn process_tenant_historical_data(
     };
 
     let total_docs = mongo_collection
-    .count_documents(filter.clone(), None)
-    .await
-    .context("Failed to count documents in MongoDB")? as usize;  // Cast to usize
-info!("Total documents to process: {}", total_docs);
+        .count_documents(filter.clone(), None)
+        .await
+        .context("Failed to count documents in MongoDB")? as usize;
+    info!("Total documents to process: {}", total_docs);
 
     let mut cursor = mongo_collection
         .find(filter, None)
         .await
         .context("Failed to create MongoDB cursor")?;
 
-
     let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
     let mut batch = Vec::with_capacity(batch_manager.get_current_size());
     let mut processed_docs = 0;
-
+    let mut failed_docs = 0;
     let start_time = Instant::now();
 
     while let Some(result) = cursor.next().await {
-        let doc = result.context("Failed to get next document from MongoDB cursor")?;
-        let record_id = doc
-            .get("_id")
-            .and_then(|id| id.as_object_id())
-            .ok_or_else(|| anyhow!("Document is missing _id field"))?;
-        let statement = doc
-            .get("statement")
-            .and_then(|s| s.as_document())
-            .ok_or_else(|| anyhow!("Document is missing statement field"))?;
+        match result {
+            Ok(doc) => {
+                let record_id = match doc.get("_id").and_then(|id| id.as_object_id()) {
+                    Some(id) => id.to_hex(),
+                    None => {
+                        warn!("Document is missing _id field, skipping");
+                        failed_docs += 1;
+                        continue;
+                    }
+                };
 
-        let record_id_str = record_id.to_hex();
-        let mut statement = statement.to_owned();
+                let statement = match doc.get("statement").and_then(|s| s.as_document()) {
+                    Some(s) => s.to_owned(),
+                    None => {
+                        warn!(
+                            "Document {} is missing statement field, skipping",
+                            record_id
+                        );
+                        failed_docs += 1;
+                        continue;
+                    }
+                };
 
-        anonymize_statement(
-            &mut statement,
-            &app_state.config.encryption_salt,
-            &tenant_config.name,
-        )?;
+                let mut statement = statement.to_owned();
 
-        let statement_str = to_string(&statement).context("Failed to serialize statement to JSON")?;
-        batch.push((record_id_str, statement_str));
+                if let Err(e) = anonymize_statement(
+                    &mut statement,
+                    &app_state.config.encryption_salt,
+                    &tenant_config.name,
+                ) {
+                    warn!(
+                        "Failed to anonymize statement for document {}: {}",
+                        record_id, e
+                    );
+                    failed_docs += 1;
+                    continue;
+                }
 
-        if batch.len() >= batch_manager.get_current_size() {
-            let batch_start_time = Instant::now();
+                let statement_str = match to_string(&statement) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Failed to serialize statement to JSON for document {}: {}",
+                            record_id, e
+                        );
+                        failed_docs += 1;
+                        continue;
+                    }
+                };
 
-            insert_into_clickhouse(
-                &ch_pool,
-                &batch,
-                &tenant_config.clickhouse_db,
-                &tenant_config.clickhouse_table,
-                &app_state.pg_pool,
-                &tenant_config.name,
-                &mut batch_manager,  // Pass batch_manager as mutable reference
-            )
-            .await
-            .context("Failed to insert batch into ClickHouse")?;
+                batch.push((record_id, statement_str));
 
-            let batch_duration = batch_start_time.elapsed();
-            batch_manager.adjust_batch_size(batch.len(), batch_duration);
+                if batch.len() >= batch_manager.get_current_size() {
+                    let batch_start_time = Instant::now();
 
-            processed_docs += batch.len();
-            info!(
-                "Processed {} out of {} documents. Current batch size: {}",
-                processed_docs, total_docs, batch_manager.get_current_size()
-            );
-            batch.clear();
+                    if let Err(e) = insert_into_clickhouse(
+                        &ch_pool,
+                        &batch,
+                        &tenant_config.clickhouse_db,
+                        &tenant_config.clickhouse_table,
+                        &app_state.pg_pool,
+                        &tenant_config.name,
+                        &mut batch_manager,
+                    )
+                    .await
+                    {
+                        error!("Failed to insert batch into ClickHouse: {}", e);
+                        failed_docs += batch.len();
+                    } else {
+                        let batch_duration = batch_start_time.elapsed();
+                        batch_manager.adjust_batch_size(batch.len(), batch_duration);
+
+                        processed_docs += batch.len();
+                        info!(
+                            "Processed {} out of {} documents. Current batch size: {}",
+                            processed_docs,
+                            total_docs,
+                            batch_manager.get_current_size()
+                        );
+                    }
+                    batch.clear();
+                }
+            }
+            Err(e) => {
+                warn!("Error fetching document from cursor: {}", e);
+                failed_docs += 1;
+            }
         }
     }
 
     // Insert any remaining documents
     if !batch.is_empty() {
-        insert_into_clickhouse(
+        if let Err(e) = insert_into_clickhouse(
             &ch_pool,
             &batch,
             &tenant_config.clickhouse_db,
@@ -260,31 +300,84 @@ info!("Total documents to process: {}", total_docs);
             &mut batch_manager,
         )
         .await
-        .context("Failed to insert final batch into ClickHouse")?;
-        processed_docs += batch.len();
+        {
+            error!("Failed to insert final batch into ClickHouse: {}", e);
+            failed_docs += batch.len();
+        } else {
+            processed_docs += batch.len();
+        }
     }
 
     let total_duration = start_time.elapsed();
     info!(
-        "Completed processing {} documents in {:?}. Final batch size: {}",
-        processed_docs, total_duration, batch_manager.get_current_size()
+        "Completed processing. Total processed: {}, Total failed: {}, Duration: {:?}, Final batch size: {}",
+        processed_docs,
+        failed_docs,
+        total_duration,
+        batch_manager.get_current_size()
     );
 
-    if processed_docs < total_docs {
+    if processed_docs + failed_docs < total_docs {
         warn!("Some documents were skipped during processing");
     }
 
     Ok(())
 }
 
-fn anonymize_statement(statement: &mut Document, encryption_salt: &str, tenant_name: &str) -> Result<()> {
-    // Implement your anonymization logic here
-    // This is a placeholder implementation
+fn anonymize_statement(
+    statement: &mut Document,
+    encryption_salt: &str,
+    tenant_name: &str,
+) -> Result<()> {
+    // Create a deep copy of the statement
+    let mut statement_copy = statement.clone();
+
+    // Check if all required fields exist
+    if !statement_copy.contains_key("actor")
+        || !statement_copy
+            .get_document("actor")?
+            .contains_key("account")
+        || !statement_copy
+            .get_document("actor")?
+            .get_document("account")?
+            .contains_key("name")
+    {
+        return Err(anyhow!("Statement is missing required fields"));
+    }
+
+    let name = statement_copy
+        .get_document("actor")?
+        .get_document("account")?
+        .get_str("name")?;
+
+    let value_to_hash = if name.contains('@') {
+        name.split('@').next().unwrap_or("")
+    } else if name.contains(':') {
+        name.split(':').last().unwrap_or("")
+    } else {
+        name
+    };
+
+    if value_to_hash.is_empty() {
+        return Err(anyhow!("Empty value to hash for name: {}", name));
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(format!("{}{}", encryption_salt, tenant_name));
-    hasher.update(statement.to_string().as_bytes());
+    hasher.update(encryption_salt.as_bytes());
+    hasher.update(tenant_name.as_bytes());
+    hasher.update(value_to_hash.as_bytes());
     let result = hasher.finalize();
-    statement.insert("anonymized_hash", hex::encode(result));
+    let hashed_value = hex::encode(result);
+
+    // Update the copy
+    statement_copy
+        .get_document_mut("actor")?
+        .get_document_mut("account")?
+        .insert("name", hashed_value);
+
+    // If we've made it this far without errors, update the original statement
+    *statement = statement_copy;
+    // println!("Anonymized statement: {:?}", statement);
     Ok(())
 }
 
@@ -322,11 +415,14 @@ async fn insert_into_clickhouse(
     clickhouse_table: &str,
     pg_pool: &PgPool,
     tenant_name: &str,
-    batch_manager: &mut BatchSizeManager,  // Added BatchSizeManager as mutable reference
+    batch_manager: &mut BatchSizeManager,
 ) -> Result<()> {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
 
-    for (chunk_index, chunk) in bulk_insert_values.chunks(batch_manager.get_current_size()).enumerate() {
+    for (chunk_index, chunk) in bulk_insert_values
+        .chunks(batch_manager.get_current_size())
+        .enumerate()
+    {
         let mut retry_count = 0;
         let mut delay = INITIAL_RETRY_DELAY;
 
@@ -392,16 +488,15 @@ async fn insert_batch(
         .await
         .context("Failed to get client from ClickHouse pool")?;
 
-    let insert_data: Result<Vec<String>> = futures::future::try_join_all(
-        batch.iter().map(|(record_id, statement)| async move {
+    let insert_data: Result<Vec<String>> =
+        futures::future::try_join_all(batch.iter().map(|(record_id, statement)| async move {
             let processed_statement = process_statement(statement).await?;
             Ok(format!(
                 "('{}', '{}', now())",
                 record_id, processed_statement
             ))
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     let insert_data = insert_data.context("Failed to process statements")?;
 
@@ -415,48 +510,6 @@ async fn insert_batch(
         .execute(insert_query.as_str())
         .await
         .context("Failed to execute insert query")?;
-
-    Ok(())
-}
-
-async fn deduplicate_clickhouse_data(
-    ch_pool: &ClickhousePool,
-    clickhouse_db: &str,
-    clickhouse_table: &str,
-) -> Result<()> {
-    let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
-    let mut client = ch_pool
-        .get_handle()
-        .await
-        .context("Failed to get client from ClickHouse pool")?;
-
-    info!("Processing duplicate data...");
-
-    let create_dedup_table_query = format!(
-        "CREATE TABLE {table}_dedup ENGINE = MergeTree() PARTITION BY toYYYYMM(created_at) PRIMARY KEY id ORDER BY (id, created_at) SETTINGS index_granularity = 8192 AS SELECT id, any(statement) AS statement, any(created_at) AS created_at FROM {table} GROUP BY id",
-        table = full_table_name
-    );
-
-    let drop_table_query = format!("DROP TABLE {}", full_table_name);
-    let rename_table_query = format!(
-        "RENAME TABLE {}_dedup TO {}",
-        full_table_name, full_table_name
-    );
-
-    client
-        .execute(create_dedup_table_query.as_str())
-        .await
-        .context("Failed to create dedup table in ClickHouse")?;
-
-    client
-        .execute(drop_table_query.as_str())
-        .await
-        .context("Failed to drop original table in ClickHouse")?;
-
-    client
-        .execute(rename_table_query.as_str())
-        .await
-        .context("Failed to rename dedup table in ClickHouse")?;
 
     Ok(())
 }
@@ -476,7 +529,7 @@ async fn log_failed_batch(
         .await
         .context("Failed to get client from PostgreSQL pool")?;
 
-        let statement = client
+    let statement = client
             .prepare(
                 "INSERT INTO failed_batches (tenant_name, clickhouse_db, clickhouse_table, failed_batch)
                  VALUES ($1, $2, $3, $4)",
@@ -484,209 +537,217 @@ async fn log_failed_batch(
             .await
             .context("Failed to prepare PostgreSQL statement")?;
 
-        client
-            .execute(
-                &statement,
-                &[
-                    &tenant_name,
-                    &clickhouse_db,
-                    &clickhouse_table,
-                    &failed_batch_json,
-                ],
-            )
+    client
+        .execute(
+            &statement,
+            &[
+                &tenant_name,
+                &clickhouse_db,
+                &clickhouse_table,
+                &failed_batch_json,
+            ],
+        )
+        .await
+        .context("Failed to execute PostgreSQL statement")?;
+
+    Ok(())
+}
+
+async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
+    let pg_pool = &app_state.pg_pool;
+
+    loop {
+        let mut client = pg_pool
+            .get()
             .await
-            .context("Failed to execute PostgreSQL statement")?;
-
-        Ok(())
-    }
-
-    async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
-        let pg_pool = &app_state.pg_pool;
-
-        loop {
-            let mut client = pg_pool.get().await.context("Failed to get PostgreSQL client")?;
-            let statement = client
-                .prepare(
-                    "SELECT id, tenant_name, clickhouse_db, clickhouse_table, failed_batch
+            .context("Failed to get PostgreSQL client")?;
+        let statement = client
+            .prepare(
+                "SELECT id, tenant_name, clickhouse_db, clickhouse_table, failed_batch
                      FROM failed_batches
                      ORDER BY created_at
                      LIMIT 100",
+            )
+            .await
+            .context("Failed to prepare PostgreSQL statement")?;
+
+        let rows = client
+            .query(&statement, &[])
+            .await
+            .context("Failed to execute PostgreSQL query")?;
+
+        for row in rows {
+            let failed_batch_id: i32 = row.get(0);
+            let tenant_name: String = row.get(1);
+            let clickhouse_db: String = row.get(2);
+            let clickhouse_table: String = row.get(3);
+            let failed_batch: String = row.get(4);
+
+            let tenant_config = app_state
+                .config
+                .tenants
+                .iter()
+                .find(|t| t.name == tenant_name)
+                .cloned();
+
+            if let Some(tenant_config) = tenant_config {
+                let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri);
+                let bulk_insert_values: Vec<(String, String)> = serde_json::from_str(&failed_batch)
+                    .context("Failed to deserialize failed batch")?;
+                let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
+                if let Err(e) = insert_into_clickhouse(
+                    &ch_pool,
+                    &bulk_insert_values,
+                    &clickhouse_db,
+                    &clickhouse_table,
+                    pg_pool,
+                    &tenant_name,
+                    &mut batch_manager,
                 )
                 .await
-                .context("Failed to prepare PostgreSQL statement")?;
-
-            let rows = client.query(&statement, &[]).await.context("Failed to execute PostgreSQL query")?;
-
-            for row in rows {
-                let failed_batch_id: i32 = row.get(0);
-                let tenant_name: String = row.get(1);
-                let clickhouse_db: String = row.get(2);
-                let clickhouse_table: String = row.get(3);
-                let failed_batch: String = row.get(4);
-
-                let tenant_config = app_state
-                    .config
-                    .tenants
-                    .iter()
-                    .find(|t| t.name == tenant_name)
-                    .cloned();
-
-                if let Some(tenant_config) = tenant_config {
-                    let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri);
-                    let bulk_insert_values: Vec<(String, String)> =
-                        serde_json::from_str(&failed_batch).context("Failed to deserialize failed batch")?;
-                    let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
-                    if let Err(e) = insert_into_clickhouse(
-                        &ch_pool,
-                        &bulk_insert_values,
-                        &clickhouse_db,
-                        &clickhouse_table,
-                        pg_pool,
-                        &tenant_name,
-                        &mut batch_manager,
-                    )
-                    .await
-                    {
-                        error!("Error retrying failed batch: {}", e);
-                    } else {
-                        let delete_statement = client
-                            .prepare("DELETE FROM failed_batches WHERE id = $1")
-                            .await
-                            .context("Failed to prepare delete statement")?;
-                        client
-                            .execute(&delete_statement, &[&failed_batch_id])
-                            .await
-                            .context("Failed to delete processed failed batch")?;
-                    }
+                {
+                    error!("Error retrying failed batch: {}", e);
+                } else {
+                    let delete_statement = client
+                        .prepare("DELETE FROM failed_batches WHERE id = $1")
+                        .await
+                        .context("Failed to prepare delete statement")?;
+                    client
+                        .execute(&delete_statement, &[&failed_batch_id])
+                        .await
+                        .context("Failed to delete processed failed batch")?;
                 }
             }
-
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    }
-
-    fn validate_date_time(date_time_str: &str) -> Result<NaiveDateTime> {
-        NaiveDateTime::parse_from_str(date_time_str, "%Y-%m-%dT%H:%M")
-            .map_err(|e| anyhow!("Invalid date and time format: {}", e))
-    }
-
-    #[tokio::main]
-    async fn main() -> Result<()> {
-        env_logger::init();
-        info!(target: "main", "Starting up");
-
-        let env = env::var("ENV").unwrap_or_else(|_| "dev".into());
-        let config_path = match env.as_str() {
-            "dev" => "config-dev.yml",
-            "prod" => "config-prod.yml",
-            _ => {
-                error!("Unsupported environment: {}", env);
-                return Err(anyhow!("Unsupported environment"));
-            }
-        };
-        let config: AppConfig = serde_yaml::from_reader(std::fs::File::open(config_path)?)?;
-
-        let tenant_name = env::args()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Missing tenant name argument"))?;
-
-        let start_date = env::args()
-            .nth(2)
-            .ok_or_else(|| anyhow!("Missing start date argument"))?;
-
-        let end_date = env::args()
-            .nth(3)
-            .ok_or_else(|| anyhow!("Missing end date argument"))?;
-
-        let start_date = validate_date_time(&start_date)?;
-        let end_date = validate_date_time(&end_date)?;
-
-        if end_date < start_date {
-            return Err(anyhow!("End date must be greater than or equal to start date"));
         }
 
-        let tenant = config
-            .tenants
-            .iter()
-            .find(|t| t.name == tenant_name)
-            .ok_or_else(|| anyhow!("Tenant not found in the configuration"))?
-            .clone();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
 
-        let clickhouse_pool = ClickhousePool::new(tenant.clickhouse_uri);
-        let pg_manager = PostgresConnectionManager::new_from_stringlike(
-            &config.pg_database_url,
-            tokio_postgres::NoTls,
-        )?;
-        let pg_pool = Pool::builder().build(pg_manager).await?;
+fn validate_date_time(date_time_str: &str) -> Result<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(date_time_str, "%Y-%m-%dT%H:%M")
+        .map_err(|e| anyhow!("Invalid date and time format: {}", e))
+}
 
-        let app_state = Arc::new(AppState {
-            config: config.clone(),
-            clickhouse_pools: vec![clickhouse_pool],
-            pg_pool,
-        });
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    info!(target: "main", "Starting up");
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let shutdown_tx_opt = Arc::new(Mutex::new(Some(shutdown_tx)));
-        let shutdown_tx_opt_clone = Arc::clone(&shutdown_tx_opt);
+    let env = env::var("ENV").unwrap_or_else(|_| "dev".into());
+    let config_path = match env.as_str() {
+        "dev" => "config-dev.yml",
+        "prod" => "config-prod.yml",
+        _ => {
+            error!("Unsupported environment: {}", env);
+            return Err(anyhow!("Unsupported environment"));
+        }
+    };
+    let config: AppConfig = serde_yaml::from_reader(std::fs::File::open(config_path)?)?;
 
-        let app_state_clone = app_state.clone();
-        let run_handle = tokio::spawn(async move {
-            match run(app_state_clone, tenant_name, start_date, end_date).await {
-                Ok(success) => {
-                    if success {
-                        info!("Program ran successfully");
-                    } else {
-                        error!("Program encountered an error");
-                    }
-                    if let Some(shutdown_tx) = shutdown_tx_opt.lock().unwrap().take() {
-                        if let Err(_) = shutdown_tx.send(()) {
-                            error!("Failed to send shutdown signal");
-                        }
-                    }
+    let tenant_name = env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow!("Missing tenant name argument"))?;
+
+    let start_date = env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow!("Missing start date argument"))?;
+
+    let end_date = env::args()
+        .nth(3)
+        .ok_or_else(|| anyhow!("Missing end date argument"))?;
+
+    let start_date = validate_date_time(&start_date)?;
+    let end_date = validate_date_time(&end_date)?;
+
+    if end_date < start_date {
+        return Err(anyhow!(
+            "End date must be greater than or equal to start date"
+        ));
+    }
+
+    let tenant = config
+        .tenants
+        .iter()
+        .find(|t| t.name == tenant_name)
+        .ok_or_else(|| anyhow!("Tenant not found in the configuration"))?
+        .clone();
+
+    let clickhouse_pool = ClickhousePool::new(tenant.clickhouse_uri);
+    let pg_manager = PostgresConnectionManager::new_from_stringlike(
+        &config.pg_database_url,
+        tokio_postgres::NoTls,
+    )?;
+    let pg_pool = Pool::builder().build(pg_manager).await?;
+
+    let app_state = Arc::new(AppState {
+        config: config.clone(),
+        clickhouse_pools: vec![clickhouse_pool],
+        pg_pool,
+    });
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let shutdown_tx_opt = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let shutdown_tx_opt_clone = Arc::clone(&shutdown_tx_opt);
+
+    let app_state_clone = app_state.clone();
+    let run_handle = tokio::spawn(async move {
+        match run(app_state_clone, tenant_name, start_date, end_date).await {
+            Ok(success) => {
+                if success {
+                    info!("Program ran successfully");
+                } else {
+                    error!("Program encountered an error");
                 }
-                Err(e) => {
-                    error!("Error running the program: {}", e);
-                    if let Some(shutdown_tx) = shutdown_tx_opt.lock().unwrap().take() {
-                        if let Err(_) = shutdown_tx.send(()) {
-                            error!("Failed to send shutdown signal");
-                        }
-                    }
-                }
-            }
-        });
-
-        let retry_handle = tokio::spawn(retry_failed_batches(app_state));
-
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                info!("Received shutdown signal, shutting down gracefully...");
-                if let Some(shutdown_tx) = shutdown_tx_opt_clone.lock().unwrap().take() {
+                if let Some(shutdown_tx) = shutdown_tx_opt.lock().unwrap().take() {
                     if let Err(_) = shutdown_tx.send(()) {
                         error!("Failed to send shutdown signal");
                     }
                 }
             }
-            _ = shutdown_rx => {
-                info!("Program finished, shutting down gracefully...");
-            }
-            run_result = run_handle => {
-                match run_result {
-                    Ok(_) => info!("Run task completed"),
-                    Err(e) => error!("Run task failed: {}", e),
-                }
-            }
-            retry_result = retry_handle => {
-                match retry_result {
-                    Ok(inner_result) => {
-                        match inner_result {
-                            Ok(_) => info!("Retry task completed successfully"),
-                            Err(e) => error!("Retry task failed: {}", e),
-                        }
+            Err(e) => {
+                error!("Error running the program: {}", e);
+                if let Some(shutdown_tx) = shutdown_tx_opt.lock().unwrap().take() {
+                    if let Err(_) = shutdown_tx.send(()) {
+                        error!("Failed to send shutdown signal");
                     }
-                    Err(e) => error!("Retry task panicked: {}", e),
                 }
             }
         }
+    });
 
-        Ok(())
+    let retry_handle = tokio::spawn(retry_failed_batches(app_state));
+
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Received shutdown signal, shutting down gracefully...");
+            if let Some(shutdown_tx) = shutdown_tx_opt_clone.lock().unwrap().take() {
+                if let Err(_) = shutdown_tx.send(()) {
+                    error!("Failed to send shutdown signal");
+                }
+            }
+        }
+        _ = shutdown_rx => {
+            info!("Program finished, shutting down gracefully...");
+        }
+        run_result = run_handle => {
+            match run_result {
+                Ok(_) => info!("Run task completed"),
+                Err(e) => error!("Run task failed: {}", e),
+            }
+        }
+        retry_result = retry_handle => {
+            match retry_result {
+                Ok(inner_result) => {
+                    match inner_result {
+                        Ok(_) => info!("Retry task completed successfully"),
+                        Err(e) => error!("Retry task failed: {}", e),
+                    }
+                }
+                Err(e) => error!("Retry task panicked: {}", e),
+            }
+        }
     }
+
+    Ok(())
+}
