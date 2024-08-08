@@ -1,11 +1,10 @@
 // src/main.rs - Live data processing
 use anyhow::{anyhow, Context, Result};
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
+use chrono::{DateTime, Utc};
 use clickhouse_rs::Pool as ClickhousePool;
 use config::{Config, File};
-use futures::{future::join_all, stream::StreamExt};
-use log::{error, info, warn};
+use futures::stream::StreamExt;
+// use log::{error, info, warn};
 use mongodb::{
     bson::{self, doc, Document},
     change_stream::event::{ChangeStreamEvent, ResumeToken},
@@ -13,14 +12,24 @@ use mongodb::{
     Client as MongoClient,
 };
 use regex::Regex;
-use rocksdb::{Options, DB};
+use rocksdb::{Error as RocksError, Options, DB};
 use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
-use std::{env, sync::Arc, time::Duration, time::Instant};
 
+use std::{env, sync::Arc, time::Duration, time::Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, instrument, warn};
+
+use futures::future::join_all;
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::{signal, sync::oneshot, task};
+
 lazy_static::lazy_static! {
     static ref BACKSLASH_REGEX_1: Regex = Regex::new(r"\\{2}").expect("Failed to compile BACKSLASH_REGEX_1");
     static ref BACKSLASH_REGEX_2: Regex = Regex::new(r"\\(?:\\\\)*").expect("Failed to compile BACKSLASH_REGEX_2");
@@ -30,29 +39,127 @@ lazy_static::lazy_static! {
 const MAX_BATCH_SIZE: usize = 10000;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: u64 = 1000;
+const MAX_RETRY_COUNT: usize = 5;
+
+#[derive(Debug)]
+pub enum StoreError {
+    RocksDB(RocksError),
+    OpenFailed,
+}
 struct RocksDBResumeTokenStore {
     db: Arc<DB>,
 }
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::RocksDB(e) => write!(f, "RocksDB error: {}", e),
+            StoreError::OpenFailed => write!(f, "Failed to open database after multiple attempts"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StoreError::RocksDB(e) => Some(e),
+            StoreError::OpenFailed => None,
+        }
+    }
+}
+
+impl From<RocksError> for StoreError {
+    fn from(error: RocksError) -> Self {
+        StoreError::RocksDB(error)
+    }
+}
 
 impl RocksDBResumeTokenStore {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_max_open_files(10000);
-        opts.set_use_fsync(true);
-        let db = DB::open(&opts, path)?;
+    #[instrument(skip(path), err)]
+    pub fn new(path: &str) -> Result<Self, StoreError> {
+        info!("Creating new RocksDBResumeTokenStore");
+        let db = Self::open_db_aggressive(path)?;
         Ok(Self { db: Arc::new(db) })
     }
 
-    pub fn update_resume_token(&self, token_bytes: &[u8], tenant_name: &str) -> Result<()> {
-        self.db.put(tenant_name.as_bytes(), token_bytes)?;
-        Ok(())
+    #[instrument(skip(path), err)]
+    fn open_db_aggressive(path: &str) -> Result<DB, StoreError> {
+        let db_path = Path::new(path);
+        let lock_file_path = db_path.join("LOCK");
+
+        // Step 1: Try to open normally
+        match Self::try_open_db(path) {
+            Ok(db) => return Ok(db),
+            Err(e) => warn!("Failed to open RocksDB normally: {}", e),
+        }
+
+        // Step 2: Remove LOCK file if it exists
+        if lock_file_path.exists() {
+            info!("Removing existing LOCK file");
+            if let Err(e) = fs::remove_file(&lock_file_path) {
+                warn!("Failed to remove LOCK file: {}", e);
+            }
+        }
+
+        // Step 3: Try to open again after removing LOCK file
+        match Self::try_open_db(path) {
+            Ok(db) => return Ok(db),
+            Err(e) => warn!("Failed to open RocksDB after removing LOCK file: {}", e),
+        }
+
+        // Step 4: If all else fails, delete the entire database and create a new one
+        warn!("Recreating the entire database");
+        if db_path.exists() {
+            if let Err(e) = fs::remove_dir_all(db_path) {
+                error!("Failed to remove existing database directory: {}", e);
+                return Err(StoreError::OpenFailed);
+            }
+        }
+
+        Self::try_open_db(path)
     }
 
-    pub fn get_resume_token(&self, tenant_name: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get(tenant_name.as_bytes())?)
+    fn try_open_db(path: &str) -> Result<DB, StoreError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_max_open_files(10_000);
+        opts.set_keep_log_file_num(10);
+        opts.set_max_total_wal_size(64 * 1024 * 1024); // 64MB
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        opts.set_max_write_buffer_number(3);
+        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB
+        opts.set_level_zero_file_num_compaction_trigger(8);
+        opts.set_level_zero_slowdown_writes_trigger(17);
+        opts.set_level_zero_stop_writes_trigger(24);
+        opts.set_num_levels(4);
+        opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB
+        opts.set_max_bytes_for_level_multiplier(8.0);
+
+        DB::open(&opts, path).map_err(|e| {
+            error!("Failed to open RocksDB: {}", e);
+            StoreError::RocksDB(e)
+        })
     }
+
+    #[instrument(skip(self, key), err)]
+    pub fn get_resume_token(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        debug!("Getting resume token");
+        self.db.get(key).map_err(|e| {
+            error!("Failed to get resume token: {}", e);
+            StoreError::from(e)
+        })
+    }
+
+    #[instrument(skip(self, key, value), err)]
+    pub fn set_resume_token(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        debug!("Setting resume token for key: {}", key);
+        self.db.put(key.as_bytes(), value).map_err(|e| {
+            error!("Failed to set resume token: {}", e);
+            StoreError::from(e)
+        })
+    }
+    // Add other methods as needed
 }
+
 #[derive(Deserialize, Clone, Debug)]
 struct TenantConfig {
     name: String,
@@ -62,6 +169,7 @@ struct TenantConfig {
     clickhouse_uri: String,
     clickhouse_db: String,
     clickhouse_table: String,
+    clickhouse_table_opt_out: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -69,16 +177,16 @@ struct AppConfig {
     tenants: Vec<TenantConfig>,
     encryption_salt: String,
     batch_size: usize,
-    number_of_workers: usize,
+    clickhouse_uri: String,
 }
 
-type PostgresPool = Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
 type ClickhousePoolType = ClickhousePool;
 
 struct AppState {
     config: AppConfig,
     clickhouse_pools: Vec<ClickhousePoolType>,
     resume_token_store: Arc<RocksDBResumeTokenStore>,
+    cached_hashes: Arc<RwLock<CachedHashSet>>,
 }
 
 struct BatchSizeManager {
@@ -171,6 +279,7 @@ async fn process_tenant_records(
     app_state: Arc<AppState>,
     pool_index: usize,
 ) -> Result<()> {
+    println!("mongo_uri: {}", tenant_config.mongo_uri);
     let mongo_client = match connect_to_mongo(&tenant_config.mongo_uri).await {
         Ok(client) => client,
         Err(e) => {
@@ -211,7 +320,7 @@ async fn process_tenant_records(
         }
     };
 
-    let mut batch = Vec::with_capacity(app_state.config.batch_size);
+    let mut batch: Vec<(String, String, String)> = Vec::with_capacity(app_state.config.batch_size);
     let mut batch_start_time = Instant::now();
     info!(
         "Starting change stream processing batch size: {}",
@@ -236,15 +345,18 @@ async fn process_tenant_records(
                         (Some(record_id), Some(statement)) => {
                             let record_id_str = record_id.to_hex();
                             let mut statement = statement.to_owned();
-
-                            if let Err(e) = anonymize_statement(
+                            // println!("statement------->: {:?}", statement);
+                            let hashed_value = match anonymize_statement(
                                 &mut statement,
                                 &app_state.config.encryption_salt,
                                 &tenant_config.name,
                             ) {
-                                warn!("Failed to anonymize statement: {}", e);
-                                continue;
-                            }
+                                Ok(hashed) => hashed,
+                                Err(e) => {
+                                    warn!("Failed to anonymize statement: {}", e);
+                                    continue;
+                                }
+                            };
 
                             let statement_str = match to_string(&statement) {
                                 Ok(s) => s,
@@ -254,19 +366,20 @@ async fn process_tenant_records(
                                 }
                             };
 
-                            batch.push((record_id_str, statement_str));
+                            batch.push((record_id_str, statement_str, hashed_value));
                             let should_process = batch.len() >= batch_manager.get_current_size()
                                 || batch_start_time.elapsed() >= Duration::from_secs(5);
 
                             if should_process {
                                 let batch_duration = batch_start_time.elapsed();
                                 if let Err(e) = process_batch(
-                                    &ch_pool,
+                                    ch_pool,
                                     &batch,
                                     &tenant_config,
                                     resume_token_store,
                                     &mut batch_manager,
                                     batch_duration,
+                                    &app_state,
                                 )
                                 .await
                                 {
@@ -281,7 +394,7 @@ async fn process_tenant_records(
                                     let tenant_name = tenant_config.name.clone();
 
                                     if let Err(e) = resume_token_store
-                                        .update_resume_token(&token_bytes, &tenant_name)
+                                        .set_resume_token(&tenant_name, &token_bytes)
                                     {
                                         error!("Failed to update resume token in RocksDB: {}", e);
                                     }
@@ -315,13 +428,15 @@ async fn process_tenant_records(
 
     if !batch.is_empty() {
         if let Err(e) = insert_into_clickhouse(
-            &ch_pool,
+            ch_pool,
             &batch,
             &tenant_config.clickhouse_db,
             &tenant_config.clickhouse_table,
+            &tenant_config.clickhouse_table_opt_out,
             resume_token_store,
             &tenant_config.name,
             &mut batch_manager,
+            &app_state,
         )
         .await
         {
@@ -332,7 +447,7 @@ async fn process_tenant_records(
                 let token_bytes = bson::to_vec(&resume_token)?;
                 let tenant_name = tenant_config.name.clone();
 
-                if let Err(e) = resume_token_store.update_resume_token(&token_bytes, &tenant_name) {
+                if let Err(e) = resume_token_store.set_resume_token(&tenant_name, &token_bytes) {
                     error!("Failed to update final resume token in RocksDB: {}", e);
                 }
             }
@@ -343,20 +458,23 @@ async fn process_tenant_records(
 
 async fn process_batch(
     ch_pool: &ClickhousePoolType,
-    batch: &[(String, String)],
+    batch: &[(String, String, String)],
     tenant_config: &TenantConfig,
     resume_token_store: &Arc<RocksDBResumeTokenStore>,
     batch_manager: &mut BatchSizeManager,
     batch_duration: Duration,
+    app_state: &Arc<AppState>,
 ) -> Result<()> {
     if let Err(e) = insert_into_clickhouse(
         ch_pool,
         batch,
         &tenant_config.clickhouse_db,
         &tenant_config.clickhouse_table,
+        &tenant_config.clickhouse_table_opt_out,
         resume_token_store,
         &tenant_config.name,
         batch_manager,
+        &app_state,
     )
     .await
     {
@@ -377,35 +495,22 @@ fn anonymize_statement(
     statement: &mut Document,
     encryption_salt: &str,
     tenant_name: &str,
-) -> Result<()> {
-    // Create a deep copy of the statement
-    let mut statement_copy = statement.clone();
+) -> Result<String> {
+    let actor = statement
+        .get_document_mut("actor")
+        .context("Missing 'actor' field")?;
+    let account = actor
+        .get_document_mut("account")
+        .context("Missing 'account' field in actor")?;
+    let name = account
+        .get_str("name")
+        .context("Missing 'name' field in account")?;
 
-    // Check if all required fields exist
-    if !statement_copy.contains_key("actor")
-        || !statement_copy
-            .get_document("actor")?
-            .contains_key("account")
-        || !statement_copy
-            .get_document("actor")?
-            .get_document("account")?
-            .contains_key("name")
-    {
-        return Err(anyhow!("Statement is missing required fields"));
-    }
-
-    let name = statement_copy
-        .get_document("actor")?
-        .get_document("account")?
-        .get_str("name")?;
-
-    let value_to_hash = if name.contains('@') {
-        name.split('@').next().unwrap_or("")
-    } else if name.contains(':') {
-        name.split(':').last().unwrap_or("")
-    } else {
-        name
-    };
+    let value_to_hash = name
+        .split('@')
+        .next()
+        .or_else(|| name.split(':').last())
+        .unwrap_or(name);
 
     if value_to_hash.is_empty() {
         return Err(anyhow!("Empty value to hash for name: {}", name));
@@ -415,18 +520,10 @@ fn anonymize_statement(
     hasher.update(encryption_salt.as_bytes());
     hasher.update(tenant_name.as_bytes());
     hasher.update(value_to_hash.as_bytes());
-    let result = hasher.finalize();
-    let hashed_value = hex::encode(result);
+    let hashed_value = hex::encode(hasher.finalize());
 
-    // Update the copy
-    statement_copy
-        .get_document_mut("actor")?
-        .get_document_mut("account")?
-        .insert("name", hashed_value);
-
-    // If we've made it this far without errors, update the original statement
-    *statement = statement_copy;
-    Ok(())
+    account.insert("name", hashed_value.clone());
+    Ok(hashed_value)
 }
 
 async fn process_statement(statement: &str) -> Result<String> {
@@ -458,14 +555,17 @@ async fn process_statement(statement: &str) -> Result<String> {
 
 async fn insert_into_clickhouse(
     ch_pool: &ClickhousePool,
-    bulk_insert_values: &[(String, String)],
+    bulk_insert_values: &[(String, String, String)],
     clickhouse_db: &str,
     clickhouse_table: &str,
+    clickhouse_table_opt_out: &str,
     resume_token_store: &RocksDBResumeTokenStore,
     tenant_name: &str,
     batch_manager: &mut BatchSizeManager,
+    app_state: &Arc<AppState>,
 ) -> Result<()> {
     let full_table_name = format!("{}.{}", clickhouse_db, clickhouse_table);
+    let full_table_name_opt_out = format!("{}.{}", clickhouse_db, clickhouse_table_opt_out);
 
     for (chunk_index, chunk) in bulk_insert_values
         .chunks(batch_manager.get_current_size())
@@ -475,8 +575,17 @@ async fn insert_into_clickhouse(
         let mut delay = INITIAL_RETRY_DELAY;
 
         loop {
-            match insert_batch(ch_pool, chunk, &full_table_name).await {
+            match insert_batch(
+                ch_pool,
+                chunk,
+                &full_table_name,
+                &full_table_name_opt_out,
+                &app_state.cached_hashes,
+            )
+            .await
+            {
                 Ok(_) => {
+                    // println!("chunk---------{:?}", chunk);
                     info!(
                         "Successfully inserted batch {} of {} records",
                         chunk_index + 1,
@@ -497,6 +606,7 @@ async fn insert_into_clickhouse(
                             tenant_name,
                             clickhouse_db,
                             clickhouse_table,
+                            clickhouse_table_opt_out,
                             chunk,
                         )
                         .await
@@ -525,38 +635,150 @@ async fn insert_into_clickhouse(
     Ok(())
 }
 
+struct CachedHashSet {
+    data: Arc<RwLock<HashSet<String>>>,
+    last_updated: Arc<RwLock<DateTime<Utc>>>,
+}
+
+impl CachedHashSet {
+    async fn new(ch_pool: &ClickhousePool) -> Result<Self> {
+        let data = Arc::new(RwLock::new(HashSet::new()));
+        let last_updated = Arc::new(RwLock::new(Utc::now()));
+        let cache = Self { data, last_updated };
+        cache.refresh(ch_pool).await?;
+        Ok(cache)
+    }
+
+    #[instrument(skip(self, ch_pool))]
+    async fn refresh(&self, ch_pool: &ClickhousePool) -> Result<()> {
+        info!("Refreshing cached HashSet");
+        let mut client = ch_pool.get_handle().await?;
+        let query = "SELECT email, hashed_moodle_id FROM default.moodle_ids WHERE (email, version) IN ( SELECT email, MAX(version) AS max_version FROM default.moodle_ids GROUP BY email )";
+        let mut cursor = client.query(query).stream();
+        let mut new_data = HashSet::new();
+
+        while let Some(row) = cursor.next().await {
+            let row = row.context("Failed to fetch row")?;
+            let hash: String = row.get("hashed_moodle_id")?;
+            debug!("Inserting hashed value: {}", hash); // Added debug log
+            new_data.insert(hash);
+        }
+
+        let mut data = self.data.write().await;
+        *data = new_data;
+        let mut last_updated = self.last_updated.write().await;
+        *last_updated = Utc::now();
+
+        info!("Cached HashSet refreshed successfully");
+        debug!("Total number of hashed values: {}", data.len()); // Added debug log
+        Ok(())
+    }
+    async fn contains(&self, value: &str) -> bool {
+        let data = self.data.read().await;
+        data.contains(value)
+    }
+}
+
+#[instrument(skip(socket, cached_hashes, ch_pool))]
+async fn handle_client(
+    mut socket: TcpStream,
+    cached_hashes: Arc<RwLock<CachedHashSet>>,
+    ch_pool: Arc<ClickhousePool>,
+) -> Result<()> {
+    let mut buffer = [0; 1024];
+    let n = socket.read(&mut buffer).await?;
+    let command = String::from_utf8_lossy(&buffer[..n]).to_string();
+
+    match command.trim() {
+        "invalidate" => {
+            info!("Received invalidation command");
+            cached_hashes.write().await.refresh(&ch_pool).await?;
+            socket.write_all(b"Cache invalidated successfully").await?;
+        }
+        _ => {
+            socket.write_all(b"Unknown command").await?;
+        }
+    }
+    socket.write_all(b"OK\n").await?;
+    Ok(())
+}
+
 async fn insert_batch(
     ch_pool: &ClickhousePool,
-    batch: &[(String, String)],
+    batch: &[(String, String, String)],
     full_table_name: &str,
+    full_table_name_opt_out: &str,
+    cached_hashes: &Arc<RwLock<CachedHashSet>>,
 ) -> Result<()> {
     let mut client = ch_pool
         .get_handle()
         .await
         .context("Failed to get client from ClickHouse pool")?;
 
-    let insert_data: Result<Vec<String>> =
-        futures::future::try_join_all(batch.iter().map(|(record_id, statement)| async move {
-            let processed_statement = process_statement(statement).await?;
-            Ok(format!(
-                "('{}', '{}', now())",
-                record_id, processed_statement
-            ))
-        }))
-        .await;
+    let mut insert_data = Vec::new();
+    let mut insert_data_opt_out = Vec::new();
 
-    let insert_data = insert_data.context("Failed to process statements")?;
-
-    let insert_query = format!(
-        "INSERT INTO {} (id, statement, created_at) VALUES {}",
-        full_table_name,
-        insert_data.join(" , ")
+    let cached_hashes_guard = cached_hashes.read().await;
+    debug!(
+        "Cached HashSet last updated: {:?}",
+        *cached_hashes_guard.data.read().await
     );
+    let processing_futures = batch.iter().map(|(record_id, statement, hashed_value)| {
+        let cached_hashes_guard = &cached_hashes_guard;
+        async move {
+            let processed_statement = process_statement(statement).await?;
+            let is_opt_out = cached_hashes_guard.contains(hashed_value).await;
+            debug!(
+                "Processed statement: {}, is_opt_out: {}",
+                processed_statement, is_opt_out
+            );
+            let formatted = format!("('{}', '{}', now())", record_id, processed_statement);
+            Ok::<_, anyhow::Error>((formatted, is_opt_out))
+        }
+    });
 
-    client
-        .execute(insert_query.as_str())
-        .await
-        .context("Failed to execute insert query")?;
+    let results = join_all(processing_futures).await;
+
+    for result in results {
+        match result {
+            Ok((formatted, is_opt_out)) => {
+                if is_opt_out {
+                    insert_data_opt_out.push(formatted);
+                } else {
+                    insert_data.push(formatted);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    drop(cached_hashes_guard); // Release the read lock
+
+    // Insert into full_table_name
+    if !insert_data.is_empty() {
+        let insert_query = format!(
+            "INSERT INTO {} (id, statement, created_at) VALUES {}",
+            full_table_name,
+            insert_data.join(", ")
+        );
+        client
+            .execute(insert_query.as_str())
+            .await
+            .context("Failed to execute insert query for full_table_name")?;
+    }
+
+    // Insert into full_table_name_opt_out
+    if !insert_data_opt_out.is_empty() {
+        let insert_query_opt_out = format!(
+            "INSERT INTO {} (id, statement, created_at) VALUES {}",
+            full_table_name_opt_out,
+            insert_data_opt_out.join(", ")
+        );
+        client
+            .execute(insert_query_opt_out.as_str())
+            .await
+            .context("Failed to execute insert query for full_table_name_opt_out")?;
+    }
 
     Ok(())
 }
@@ -566,15 +788,16 @@ async fn log_failed_batch(
     tenant_name: &str,
     clickhouse_db: &str,
     clickhouse_table: &str,
-    failed_batch: &[(String, String)],
+    clickhouse_table_opt_out: &str,
+    failed_batch: &[(String, String, String)],
 ) -> Result<()> {
     let failed_batch_json =
         serde_json::to_string(failed_batch).context("Failed to serialize failed batch to JSON")?;
 
     resume_token_store.db.put(
         format!(
-            "failed_batch:{}:{}:{}",
-            tenant_name, clickhouse_db, clickhouse_table
+            "failed_batch:{}:{}:{}:{}",
+            tenant_name, clickhouse_db, clickhouse_table, clickhouse_table_opt_out
         )
         .as_bytes(),
         failed_batch_json.as_bytes(),
@@ -585,7 +808,6 @@ async fn log_failed_batch(
 
 async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
     let resume_token_store = &app_state.resume_token_store;
-
     loop {
         let iter = resume_token_store.db.iterator(rocksdb::IteratorMode::Start);
         let failed_batch_prefix = b"failed_batch:";
@@ -594,6 +816,7 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
             let (key, value) = item?;
             if key.starts_with(failed_batch_prefix) {
                 let key_str = String::from_utf8_lossy(&key);
+                println!("key_str: {}", key_str);
                 let parts: Vec<&str> = key_str.splitn(4, ':').collect();
                 if parts.len() != 4 {
                     error!("Invalid failed batch key format: {}", key_str);
@@ -603,8 +826,9 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
                 let tenant_name = parts[1];
                 let clickhouse_db = parts[2];
                 let clickhouse_table = parts[3];
+                let clickhouse_table_opt_out = parts[4];
 
-                let failed_batch: Vec<(String, String)> =
+                let failed_batch: Vec<(String, String, String)> =
                     serde_json::from_slice(&value).context("Failed to deserialize failed batch")?;
 
                 let tenant_config = app_state
@@ -623,9 +847,11 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
                         &failed_batch,
                         clickhouse_db,
                         clickhouse_table,
+                        clickhouse_table_opt_out,
                         resume_token_store,
                         tenant_name,
                         &mut batch_manager,
+                        &app_state,
                     )
                     .await
                     {
@@ -650,6 +876,45 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
         }
 
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn run_socket_server(
+    cached_hashes: Arc<RwLock<CachedHashSet>>,
+    ch_pool: Arc<ClickhousePool>,
+    retry_count: Arc<AtomicUsize>,
+) -> Result<()> {
+    loop {
+        match TcpListener::bind("0.0.0.0:8088").await {
+            Ok(listener) => {
+                info!("Socket server listening on 0.0.0.0:8088");
+                retry_count.store(0, Ordering::SeqCst);
+
+                while let Ok((socket, _)) = listener.accept().await {
+                    let cached_hashes = Arc::clone(&cached_hashes);
+                    let ch_pool = Arc::clone(&ch_pool);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(socket, cached_hashes, ch_pool).await {
+                            error!("Error handling client: {:?}", e);
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                error!("Failed to bind socket server: {:?}", e);
+                let current_retry = retry_count.fetch_add(1, Ordering::SeqCst);
+                if current_retry >= MAX_RETRY_COUNT {
+                    error!("Socket server failed to start after {} attempts. Shutting down socket server.", MAX_RETRY_COUNT);
+                    return Err(anyhow!("Socket server permanently down"));
+                }
+                let backoff_duration = Duration::from_secs(2u64.pow(current_retry as u32));
+                error!("Retrying in {:?}...", backoff_duration);
+                tokio::time::sleep(backoff_duration).await;
+            }
+        }
+
+        error!("Socket server stopped unexpectedly. Restarting...");
     }
 }
 
@@ -679,13 +944,18 @@ async fn main() -> Result<()> {
         let clickhouse_pool = ClickhousePool::new(tenant.clickhouse_uri.as_str());
         clickhouse_pools.push(clickhouse_pool);
     }
-
-    let resume_token_store = Arc::new(RocksDBResumeTokenStore::new("/app/data/rocksdb")?);
+    let ch_pool = Arc::new(ClickhousePool::new(config.clickhouse_uri.as_str()));
+    let cached_hashes = Arc::new(RwLock::new(CachedHashSet::new(&ch_pool).await?));
+    let resume_token_store = Arc::new(
+        RocksDBResumeTokenStore::new("/app/data/rocksdb")
+            .expect("Failed to create resume token store"),
+    );
 
     let app_state = Arc::new(AppState {
         config,
         clickhouse_pools,
         resume_token_store,
+        cached_hashes: Arc::clone(&cached_hashes),
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -705,6 +975,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    let retry_count = Arc::new(AtomicUsize::new(0));
+    let socket_server_handle = tokio::spawn({
+        let cached_hashes = Arc::clone(&cached_hashes);
+        let ch_pool = Arc::clone(&ch_pool);
+        let retry_count = Arc::clone(&retry_count);
+        async move {
+            if let Err(e) = run_socket_server(cached_hashes, ch_pool, retry_count).await {
+                error!("Socket server encountered a permanent error: {:?}", e);
+                error!("Socket server will not be restarted.");
+            }
+        }
+    });
+
     tokio::select! {
         _ = signal::ctrl_c() => {
             info!("Received shutdown signal, shutting down gracefully...");
@@ -720,6 +1003,13 @@ async fn main() -> Result<()> {
         }
         _ = retry_handle => {
             info!("Retry failed batches loop has completed.");
+        }
+        _ = socket_server_handle => {
+            if retry_count.load(Ordering::SeqCst) >= MAX_RETRY_COUNT {
+                warn!("Socket server has permanently shut down after maximum retry attempts.");
+            } else {
+                info!("Socket server has unexpectedly shut down.");
+            }
         }
     }
 

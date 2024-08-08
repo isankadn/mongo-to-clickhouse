@@ -29,4 +29,6 @@ sqlx = "0.8.0"
 chrono = "0.4.35"
 regex = "1.10.4"
 lazy_static = "1.4.0"
+rocksdb = "0.22.0"
+tracing = "0.1.40"
 
