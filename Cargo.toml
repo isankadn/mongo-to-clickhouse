@@ -31,6 +31,8 @@ regex = "1.10.4"
 lazy_static = "1.4.0"
 rocksdb = "0.22.0"
 time = "0.3.36"
+tracing = "0.1.40"
+backoff = "0.4.0"
 
 
 
