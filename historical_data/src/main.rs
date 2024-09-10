@@ -1,14 +1,12 @@
 // src/main.rs - Live data processing
 use anyhow::{anyhow, Context, Result};
-use chrono::{Date, DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clickhouse_rs::Pool as ClickhousePool;
 use config::{Config, File};
 use futures::stream::StreamExt;
 // use log::{error, info, warn};
 use mongodb::{
-    bson::{self, doc, DateTime as BosonDateTime, Document},
-    change_stream::event::{ChangeStreamEvent, ResumeToken},
-    options::ChangeStreamOptions,
+    bson::{self, doc, DateTime as BsonDateTime, Document},
     Client as MongoClient,
 };
 use regex::Regex;
@@ -20,14 +18,13 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use std::{env, sync::Arc, time::Duration, time::Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::{signal, sync::oneshot, task};
+
+use tokio::{signal, sync::oneshot};
 
 lazy_static::lazy_static! {
     static ref BACKSLASH_REGEX_1: Regex = Regex::new(r"\\{2}").expect("Failed to compile BACKSLASH_REGEX_1");
@@ -35,7 +32,7 @@ lazy_static::lazy_static! {
     static ref BACKSLASH_REGEX_3: Regex = Regex::new(r"\\{4,}").expect("Failed to compile BACKSLASH_REGEX_3");
 }
 
-const MAX_BATCH_SIZE: usize = 10000;
+const MAX_BATCH_SIZE: usize = 8000;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: u64 = 1000;
 const MAX_RETRY_COUNT: usize = 5;
@@ -255,12 +252,18 @@ impl BatchSizeManager {
 
     fn adjust_batch_size(&mut self, docs_processed: usize, time_taken: Duration) {
         let performance = docs_processed as f64 / time_taken.as_secs_f64();
+        let old_size = self.current_size;
 
         if performance > self.performance_threshold {
             self.current_size = (self.current_size * 2).min(self.max_size);
         } else {
             self.current_size = (self.current_size / 2).max(self.min_size);
         }
+
+        info!(
+            "Batch size adjusted: {} -> {}. Performance: {:.2}, Threshold: {:.2}",
+            old_size, self.current_size, performance, self.performance_threshold
+        );
     }
 
     fn get_current_size(&self) -> usize {
@@ -361,11 +364,11 @@ async fn process_tenant_historical_data(
         .await
         .context("Failed to create MongoDB cursor")?;
 
-    let mut batch: Vec<(String, String, BosonDateTime, String)> =
+    let mut batch: Vec<(String, String, BsonDateTime, String)> =
         Vec::with_capacity(app_state.config.batch_size);
     let mut batch_start_time = Instant::now();
     let mut batch_manager =
-        BatchSizeManager::new(app_state.config.batch_size, 1, MAX_BATCH_SIZE, 5000.0);
+        BatchSizeManager::new(app_state.config.batch_size, 5000, MAX_BATCH_SIZE, 10000.0);
 
     let mut processed_docs = 0;
     let mut failed_docs = 0;
@@ -514,7 +517,7 @@ async fn process_tenant_historical_data(
 
 async fn process_batch(
     ch_pool: &ClickhousePool,
-    batch: &[(String, String, BosonDateTime, String)],
+    batch: &[(String, String, BsonDateTime, String)],
     tenant_config: &TenantConfig,
     resume_token_store: &RocksDBResumeTokenStore,
     batch_manager: &mut BatchSizeManager,
@@ -606,7 +609,7 @@ async fn process_statement(statement: &str) -> Result<String> {
 
 async fn insert_into_clickhouse(
     ch_pool: &ClickhousePool,
-    bulk_insert_values: &[(String, String, BosonDateTime, String)],
+    bulk_insert_values: &[(String, String, BsonDateTime, String)],
     clickhouse_db: &str,
     clickhouse_table: &str,
     clickhouse_table_opt_out: &str,
@@ -691,7 +694,7 @@ async fn log_failed_batch(
     clickhouse_db: &str,
     clickhouse_table: &str,
     clickhouse_table_opt_out: &str,
-    failed_batch: &[(String, String, BosonDateTime, String)],
+    failed_batch: &[(String, String, BsonDateTime, String)],
 ) -> Result<()> {
     let failed_batch_json =
         serde_json::to_string(failed_batch).context("Failed to serialize failed batch to JSON")?;
@@ -710,7 +713,7 @@ async fn log_failed_batch(
 
 async fn insert_batch(
     ch_pool: &ClickhousePool,
-    batch: &[(String, String, BosonDateTime, String)],
+    batch: &[(String, String, BsonDateTime, String)],
     full_table_name: &str,
     full_table_name_opt_out: &str,
     cached_hashes: &Arc<RwLock<CachedHashSet>>,
@@ -813,7 +816,7 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
                 let clickhouse_table = parts[3];
                 let clickhouse_table_opt_out = parts[4];
 
-                let failed_batch: Vec<(String, String, BosonDateTime, String)> =
+                let failed_batch: Vec<(String, String, BsonDateTime, String)> =
                     serde_json::from_slice(&value).context("Failed to deserialize failed batch")?;
 
                 let tenant_config = app_state
@@ -825,7 +828,12 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
 
                 if let Some(tenant_config) = tenant_config {
                     let ch_pool = ClickhousePool::new(tenant_config.clickhouse_uri.as_str());
-                    let mut batch_manager = BatchSizeManager::new(10000, 1000, 100000, 5000.0);
+                    let mut batch_manager = BatchSizeManager::new(
+                        app_state.config.batch_size,
+                        100,
+                        MAX_BATCH_SIZE,
+                        1000.0,
+                    );
 
                     match insert_into_clickhouse(
                         &ch_pool,
