@@ -710,11 +710,13 @@ async fn insert_batch(
     full_table_name_opt_out: &str,
     cached_hashes: &Arc<RwLock<CachedHashSet>>,
 ) -> Result<()> {
-    let mut client = ch_pool
-        .get_handle()
-        .await
-        .context("Failed to get client from ClickHouse pool")?;
-
+    let mut client = match ch_pool.get_handle().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get ClickHouse client: {:?}", e);
+            return Err(anyhow!("ClickHouse connection error: {:?}", e));
+        }
+    };
     let mut insert_data = Vec::new();
     let mut insert_data_opt_out = Vec::new();
 
@@ -816,7 +818,7 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
             let (key, value) = item?;
             if key.starts_with(failed_batch_prefix) {
                 let key_str = String::from_utf8_lossy(&key);
-                println!("key_str: {}", key_str);
+                // println!("key_str: {}", key_str);
                 let parts: Vec<&str> = key_str.splitn(4, ':').collect();
                 if parts.len() != 4 {
                     error!("Invalid failed batch key format: {}", key_str);

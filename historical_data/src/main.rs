@@ -1,12 +1,12 @@
 // src/main.rs - Live data processing
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{Date, DateTime, NaiveDateTime, Utc};
 use clickhouse_rs::Pool as ClickhousePool;
 use config::{Config, File};
 use futures::stream::StreamExt;
 // use log::{error, info, warn};
 use mongodb::{
-    bson::{self, doc, Document},
+    bson::{self, doc, DateTime as BosonDateTime, Document},
     change_stream::event::{ChangeStreamEvent, ResumeToken},
     options::ChangeStreamOptions,
     Client as MongoClient,
@@ -361,7 +361,8 @@ async fn process_tenant_historical_data(
         .await
         .context("Failed to create MongoDB cursor")?;
 
-    let mut batch: Vec<(String, String, String)> = Vec::with_capacity(app_state.config.batch_size);
+    let mut batch: Vec<(String, String, BosonDateTime, String)> =
+        Vec::with_capacity(app_state.config.batch_size);
     let mut batch_start_time = Instant::now();
     let mut batch_manager =
         BatchSizeManager::new(app_state.config.batch_size, 1, MAX_BATCH_SIZE, 5000.0);
@@ -402,7 +403,8 @@ async fn process_tenant_historical_data(
                         continue;
                     }
                 };
-                println!("timestamp----------: {:?}", timestamp);
+
+                // println!("timestamp----------: {:?}", timestamp);
                 let mut statement = statement.to_owned();
                 let hashed_value = match anonymize_statement(
                     &mut statement,
@@ -432,7 +434,7 @@ async fn process_tenant_historical_data(
                     }
                 };
 
-                batch.push((record_id, statement_str, hashed_value));
+                batch.push((record_id, statement_str, *timestamp, hashed_value));
 
                 let should_process = batch.len() >= batch_manager.get_current_size()
                     || batch_start_time.elapsed() >= Duration::from_secs(5);
@@ -512,7 +514,7 @@ async fn process_tenant_historical_data(
 
 async fn process_batch(
     ch_pool: &ClickhousePool,
-    batch: &[(String, String, String)],
+    batch: &[(String, String, BosonDateTime, String)],
     tenant_config: &TenantConfig,
     resume_token_store: &RocksDBResumeTokenStore,
     batch_manager: &mut BatchSizeManager,
@@ -604,7 +606,7 @@ async fn process_statement(statement: &str) -> Result<String> {
 
 async fn insert_into_clickhouse(
     ch_pool: &ClickhousePool,
-    bulk_insert_values: &[(String, String, String)],
+    bulk_insert_values: &[(String, String, BosonDateTime, String)],
     clickhouse_db: &str,
     clickhouse_table: &str,
     clickhouse_table_opt_out: &str,
@@ -689,7 +691,7 @@ async fn log_failed_batch(
     clickhouse_db: &str,
     clickhouse_table: &str,
     clickhouse_table_opt_out: &str,
-    failed_batch: &[(String, String, String)],
+    failed_batch: &[(String, String, BosonDateTime, String)],
 ) -> Result<()> {
     let failed_batch_json =
         serde_json::to_string(failed_batch).context("Failed to serialize failed batch to JSON")?;
@@ -708,15 +710,18 @@ async fn log_failed_batch(
 
 async fn insert_batch(
     ch_pool: &ClickhousePool,
-    batch: &[(String, String, String)],
+    batch: &[(String, String, BosonDateTime, String)],
     full_table_name: &str,
     full_table_name_opt_out: &str,
     cached_hashes: &Arc<RwLock<CachedHashSet>>,
 ) -> Result<()> {
-    let mut client = ch_pool
-        .get_handle()
-        .await
-        .context("Failed to get client from ClickHouse pool")?;
+    let mut client = match ch_pool.get_handle().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get ClickHouse client: {:?}", e);
+            return Err(anyhow!("ClickHouse connection error: {:?}", e));
+        }
+    };
 
     let mut insert_data = Vec::new();
     let mut insert_data_opt_out = Vec::new();
@@ -727,7 +732,7 @@ async fn insert_batch(
         *cached_hashes_guard.last_updated.read().await
     );
 
-    for (record_id, statement, hashed_value) in batch {
+    for (record_id, statement, timestamp, hashed_value) in batch {
         let processed_statement = process_statement(statement).await?;
         let is_opt_out = cached_hashes_guard.contains(hashed_value).await;
 
@@ -735,8 +740,18 @@ async fn insert_batch(
             "Processed statement: {}, is_opt_out: {}",
             processed_statement, is_opt_out
         );
+        // let timestamp: DateTime<Utc> = Utc::now();
+        // println!("timestamp----------------> {}", timestamp);
+        let millis = timestamp.timestamp_millis();
+        let chrono_timestamp: DateTime<Utc> = DateTime::from_timestamp_millis(millis).unwrap();
 
-        let formatted = format!("('{}', '{}', now())", record_id, processed_statement);
+        // Format the timestamp for ClickHouse
+        let formatted_timestamp = chrono_timestamp.format("%Y-%m-%d %H:%M:%S%.3f");
+
+        let formatted = format!(
+            "('{}', '{}', now(), '{}')",
+            record_id, processed_statement, formatted_timestamp
+        );
 
         if is_opt_out {
             insert_data_opt_out.push(formatted);
@@ -750,7 +765,7 @@ async fn insert_batch(
     // Insert into full_table_name
     if !insert_data.is_empty() {
         let insert_query = format!(
-            "INSERT INTO {} (id, statement, created_at) VALUES {}",
+            "INSERT INTO {} (id, statement, created_at, timestamp) VALUES {}",
             full_table_name,
             insert_data.join(", ")
         );
@@ -763,7 +778,7 @@ async fn insert_batch(
     // Insert into full_table_name_opt_out
     if !insert_data_opt_out.is_empty() {
         let insert_query_opt_out = format!(
-            "INSERT INTO {} (id, statement, created_at) VALUES {}",
+            "INSERT INTO {} (id, statement, created_at, timestamp) VALUES {}",
             full_table_name_opt_out,
             insert_data_opt_out.join(", ")
         );
@@ -798,7 +813,7 @@ async fn retry_failed_batches(app_state: Arc<AppState>) -> Result<()> {
                 let clickhouse_table = parts[3];
                 let clickhouse_table_opt_out = parts[4];
 
-                let failed_batch: Vec<(String, String, String)> =
+                let failed_batch: Vec<(String, String, BosonDateTime, String)> =
                     serde_json::from_slice(&value).context("Failed to deserialize failed batch")?;
 
                 let tenant_config = app_state
