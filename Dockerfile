@@ -44,5 +44,6 @@ COPY config-prod.yml ./config-prod.yml
 COPY config-dev.yml ./config-dev.yml
 RUN mkdir -p /data/rocksdb
 ENV RUSTFLAGS="-C target-cpu=native"
+ENV RUST_LOG=debug
 ENV RUST_ENV=prod 
 CMD ["./mongo-to-clickhouse"]
