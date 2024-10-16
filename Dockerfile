@@ -1,10 +1,15 @@
 # Build Stage
 FROM rust:latest as builder
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && apt-get install -y \
     librocksdb-dev \
     libclang-dev \
     clang \
+    tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime \
+    && echo "Asia/Tokyo" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
     
 WORKDIR /app
