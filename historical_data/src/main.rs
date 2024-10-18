@@ -353,21 +353,11 @@ async fn process_tenant_historical_data(
         }
     };
 
-<<<<<<< HEAD
     let total_docs = mongo_collection
         .count_documents(filter.clone(), None)
         .await
         .context("Failed to count documents in MongoDB")? as usize;
     info!("Total documents to process: {}", total_docs);
-=======
-        match mongo_collection.find(None, options).await {
-            Ok(mut cursor) => {
-                while let Some(result) = cursor.next().await {
-                    // print!("tent info:  {:?}", &tenant_config.name);
-                    if let Ok(doc) = result {
-                        let record_id = doc.get("_id").and_then(|id| id.as_object_id());
-                        let statement = doc.get("statement").and_then(|s| s.as_document());
->>>>>>> e07455a (na)
 
     let mut cursor = mongo_collection
         .find(filter, None)
